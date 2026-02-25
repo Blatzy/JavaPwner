@@ -39,6 +39,7 @@ import java.util.Set;
  * capabilities ({@code JoinAdmin}, {@code DestroyAdmin},
  * {@code StorageLocationAdmin}), and lists registered services.
  */
+@SuppressWarnings({"removal", "deprecation"})
 public class JiniInspector {
 
     // DestroyAdmin lives in different packages depending on Jini vs River

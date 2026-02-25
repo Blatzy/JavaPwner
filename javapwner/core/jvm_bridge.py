@@ -198,6 +198,22 @@ class JvmBridge:
             self._classpath = _build_classpath(self._classpath_parts)
         return self._classpath
 
+    @property
+    def api_classpath(self) -> str:
+        """Classpath with only API JARs (no implementation proxies).
+
+        Excludes ``reggie*.jar`` so that RMI is forced to download the
+        correct proxy classes from the target's codebase.  This avoids
+        ``serialVersionUID`` mismatches when the target runs a different
+        Jini/River version than the local JARs.
+        """
+        parts = self.classpath.split(_PATH_SEP)
+        filtered = [
+            p for p in parts
+            if not Path(p).name.startswith("reggie")
+        ]
+        return _PATH_SEP.join(filtered)
+
     def has_jini_jars(self) -> bool:
         """Return True if at least one Jini/River JAR was found."""
         jars = _discover_jars()
@@ -297,29 +313,80 @@ class JvmBridge:
     ) -> dict[str, Any]:
         """Run ``JiniInspector`` and return the parsed JSON result.
 
-        Compiles the Java helper if needed, then executes it as a
-        subprocess.
+        Uses a **two-pass strategy** to handle ``serialVersionUID``
+        mismatches across Jini/River versions:
+
+        1. **Pass 1 — API-only classpath** (no ``reggie*.jar``).  RMI
+           downloads the correct proxy classes from the target's
+           codebase via ``SecurityManager``.  Works when the target
+           advertises a codebase URL.
+        2. **Pass 2 — full classpath** (includes local ``reggie*.jar``).
+           Fallback when the target has no codebase.  May fail with
+           ``InvalidClassException`` if the local JAR version doesn't
+           match the remote one.
 
         Raises :class:`JvmBridgeError` on infrastructure failures
         (missing JDK, compilation error, JSON parse error).
         The returned dict always has a ``"success"`` key.
         """
-        # Ensure compiled
         self.compile_inspector()
 
         if not self._java:
             raise JvmBridgeError("java not found — cannot run JiniInspector")
 
+        # Pass 1: API-only classpath — let RMI download the right proxy
+        logger.info("Pass 1: API-only classpath (RMI codebase loading)")
+        result = self._execute_inspector(
+            self.api_classpath, host, port, timeout_ms,
+        )
+
+        if result.get("success"):
+            return result
+
+        error = result.get("error", "")
+        needs_retry = (
+            "ClassNotFoundException" in error
+            or "class loader disabled" in error
+            or "NoClassDefFoundError" in error
+        )
+
+        if not needs_retry:
+            # Non-classloading error (timeout, connection refused, etc.)
+            return result
+
+        # Pass 2: full classpath with local proxy JARs
+        logger.info(
+            "Pass 1 failed (%s) — retrying with local proxy JARs",
+            error[:120],
+        )
+        result_full = self._execute_inspector(
+            self.classpath, host, port, timeout_ms,
+        )
+
+        if result_full.get("success"):
+            return result_full
+
+        # Both passes failed — return the more specific error
+        return result_full
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _execute_inspector(
+        self,
+        classpath: str,
+        host: str,
+        port: int,
+        timeout_ms: int,
+    ) -> dict[str, Any]:
+        """Low-level: launch JiniInspector with the given *classpath*."""
         cmd = [
             self._java,
-            "-cp", self.classpath,
+            "-cp", classpath,
         ]
 
         # Security policy for RMI codebase class loading.
-        # On Java 24+ SecurityManager is permanently disabled — the flags
-        # are harmless no-ops and JiniInspector catches the exception.
-        # Proxy classes (reggie-dl.jar) on the local classpath provide
-        # a fallback that works on ALL Java versions.
         if _SECURITY_POLICY.is_file():
             cmd.append(f"-Djava.security.policy={_SECURITY_POLICY}")
         cmd.append("-Djava.rmi.server.useCodebaseOnly=false")
