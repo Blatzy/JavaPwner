@@ -16,7 +16,10 @@ exactly what to try next.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from javapwner.protocols.jini.registrar import RegistrarInfo
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +114,7 @@ def assess_exploitation(
     class_names: list[str] | None = None,
     codebase_results: list[dict[str, Any]] | None = None,
     proxy_interfaces: list[str] | None = None,
+    registrar_info: RegistrarInfo | None = None,
     target: str = "",
     port: int = 4160,
 ) -> ExploitAssessment:
@@ -131,6 +135,8 @@ def assess_exploitation(
         List of ``CodebaseExploreResult.to_dict()`` dicts.
     proxy_interfaces:
         Interface names from the Jini proxy (dynamic proxy classes).
+    registrar_info:
+        Tier 2 registrar inspection result (heuristic or JVM).
     target, port:
         For generating recommended commands.
     """
@@ -361,6 +367,124 @@ def assess_exploitation(
             ),
             action="# Investigate these interfaces for exploitable methods.",
         ))
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 6. Registrar admin interface analysis (Tier 2)
+    # ──────────────────────────────────────────────────────────────────────
+    if registrar_info is not None:
+        _ri = registrar_info  # short alias
+
+        # --- DestroyAdmin → DoS ---
+        if _ri.has_destroy_admin:
+            vectors.append(AttackVector(
+                title="DestroyAdmin available — remote service destruction (DoS)",
+                severity=RISK_HIGH,
+                detail=(
+                    "The Registrar's admin object implements DestroyAdmin. "
+                    "Calling destroy() will shut down the Lookup Service, "
+                    "causing a denial of service for all Jini clients that "
+                    "depend on it for service discovery."
+                ),
+                action=(
+                    "# WARNING: Destructive action — confirm with client before executing.\n"
+                    "# ((DestroyAdmin) admin).destroy();\n"
+                    f"{cmd_base} admin {t_flag} --action check  # inspect first"
+                ),
+            ))
+
+        # --- JoinAdmin → group/attribute manipulation ---
+        if _ri.has_join_admin:
+            detail_parts = [
+                "The Registrar's admin object implements JoinAdmin, allowing "
+                "modification of groups, locators, and service attributes."
+            ]
+            ja_details = next(
+                (c.details for c in _ri.admin_capabilities if c.name == "JoinAdmin"),
+                {},
+            )
+            if ja_details.get("groups"):
+                detail_parts.append(
+                    f"Current groups: {', '.join(ja_details['groups'])}"
+                )
+            vectors.append(AttackVector(
+                title="JoinAdmin available — service group manipulation",
+                severity=RISK_HIGH,
+                detail=" ".join(detail_parts),
+                action=(
+                    "# An attacker can:\n"
+                    "#   - Change discovery groups to isolate or hijack services\n"
+                    "#   - Add malicious locators to redirect clients\n"
+                    "#   - Modify service attributes for spoofing\n"
+                    f"{cmd_base} admin {t_flag} --action check"
+                ),
+            ))
+
+        # --- StorageLocationAdmin → information disclosure ---
+        if _ri.has_storage_admin:
+            sa_details = next(
+                (c.details for c in _ri.admin_capabilities if c.name == "StorageLocationAdmin"),
+                {},
+            )
+            location = sa_details.get("location", "unknown")
+            vectors.append(AttackVector(
+                title=f"StorageLocationAdmin — storage path: {location}",
+                severity=RISK_MEDIUM,
+                detail=(
+                    "The admin object exposes the Reggie persistent storage "
+                    f"location ({location}). This leaks filesystem paths and "
+                    "may help target path traversal or file-read attacks."
+                ),
+                action="# Use the disclosed path for targeted file reading.",
+            ))
+
+        # --- Administrable but no specific capabilities identified ---
+        if _ri.is_administrable and not _ri.admin_capabilities:
+            vectors.append(AttackVector(
+                title="Registrar is Administrable (capabilities unknown)",
+                severity=RISK_MEDIUM,
+                detail=(
+                    "The Registrar proxy implements Administrable, meaning "
+                    "getAdmin() can be called.  However, the specific admin "
+                    "interfaces were not identified.  Run Tier 2 enumeration "
+                    "with a JVM bridge to fully inspect capabilities."
+                ),
+                action=f"{cmd_base} admin {t_flag} --action check",
+            ))
+
+        # --- Heuristic-only Administrable detection ---
+        if (
+            _ri.source == "heuristic"
+            and _ri.is_administrable
+            and _ri.admin_capabilities
+        ):
+            cap_names = [c.name for c in _ri.admin_capabilities]
+            vectors.append(AttackVector(
+                title=f"Admin interfaces detected heuristically: {', '.join(cap_names)}",
+                severity=RISK_MEDIUM,
+                detail=(
+                    "Admin interfaces were detected from the serialized proxy "
+                    "class descriptors (no JVM used).  To confirm capabilities "
+                    "and enumerate registered services, run with --tier2."
+                ),
+                action=f"{cmd_base} scan {t_flag} --tier2",
+            ))
+
+        # --- Registered services (from JVM inspection) ---
+        if _ri.services:
+            admin_svcs = [s for s in _ri.services if s.is_administrable]
+            if admin_svcs:
+                svc_names = [s.class_name.rsplit(".", 1)[-1] for s in admin_svcs[:5]]
+                vectors.append(AttackVector(
+                    title=f"Administrable services registered: {', '.join(svc_names)}",
+                    severity=RISK_MEDIUM,
+                    detail=(
+                        f"{len(admin_svcs)} of {_ri.total_services} registered "
+                        "services implement Administrable.  Each can be inspected "
+                        "for JoinAdmin/DestroyAdmin capabilities, expanding the "
+                        "attack surface beyond the Registrar itself."
+                    ),
+                    action=f"{cmd_base} admin {t_flag} --action check",
+                ))
 
     # --- If nothing specific, but JRMP is open ---
     if not vectors and dgc_reachable:

@@ -15,8 +15,12 @@ This module combines multiple enumeration sources:
   Probe the HTTP codebase server for directory listings, test path traversal,
   and read arbitrary files from the target filesystem.
 
-Tier 2 enumeration (full ``ServiceRegistrar.lookup()`` via JVM bridge) is
-reserved for future implementation.
+**Tier 2 — Active Registrar Inspection** (JVM bridge required):
+  Connect to the Jini Lookup Service via ``LookupLocator``, retrieve the
+  ``ServiceRegistrar`` proxy, check ``instanceof Administrable``, call
+  ``getAdmin()`` to enumerate admin capabilities (``JoinAdmin``,
+  ``DestroyAdmin``, ``StorageLocationAdmin``), and list all registered
+  services.  Requires a JDK and Jini/River JARs.
 """
 
 from __future__ import annotations
@@ -39,6 +43,11 @@ from javapwner.core.serialization import (
     parse_class_descriptors,
 )
 from javapwner.protocols.jini.codebase import CodebaseExploreResult, CodebaseExplorer
+from javapwner.protocols.jini.registrar import (
+    RegistrarInfo,
+    RegistrarInspector,
+    heuristic_admin_check,
+)
 from javapwner.protocols.jini.scanner import JiniScanner, ScanResult
 
 # Patterns that suggest interesting Jini / Java RMI class names
@@ -72,6 +81,9 @@ class EnumResult:
     # --- Tier 1++ (HTTP codebase exploitation) ---
     codebase_exploits: list[CodebaseExploreResult] = field(default_factory=list)
 
+    # --- Tier 2 (JVM bridge — Registrar admin inspection) ---
+    registrar_info: RegistrarInfo | None = None
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "tier": self.tier,
@@ -93,6 +105,8 @@ class EnumResult:
             "java_version_hints": self.java_version_hints,
             # Codebase exploitation
             "codebase_exploits": [e.to_dict() for e in self.codebase_exploits],
+            # Tier 2
+            "registrar_info": self.registrar_info.to_dict() if self.registrar_info else None,
         }
 
 
@@ -206,7 +220,58 @@ class JiniEnumerator:
                     exploit_result = explorer.explore(base_url)
                     result.codebase_exploits.append(exploit_result)
 
+        # === Heuristic admin check (always, no JVM) ===
+        if result.proxy_interfaces or result.extracted_classes:
+            result.registrar_info = heuristic_admin_check(
+                proxy_interfaces=result.proxy_interfaces,
+                class_names=result.extracted_classes,
+            )
+
         return result
+
+    def enumerate_tier2(
+        self,
+        host: str,
+        port: int,
+        bridge: "JvmBridge",  # noqa: F821 — forward ref
+        enum_result: EnumResult | None = None,
+        *,
+        progress_cb: Callable[[str], None] | None = None,
+    ) -> RegistrarInfo:
+        """Run Tier 2 active Registrar inspection via the JVM bridge.
+
+        This requires a JDK and Jini/River JARs.  It connects to the
+        real Lookup Service, calls ``getAdmin()``, and inspects the
+        admin object's interfaces.
+
+        Parameters
+        ----------
+        host, port:
+            Target Jini lookup service.
+        bridge:
+            A configured :class:`~javapwner.core.jvm_bridge.JvmBridge`.
+        enum_result:
+            Optional pre-existing :class:`EnumResult` whose
+            ``registrar_info`` will be updated in-place.
+        progress_cb:
+            Optional progress callback.
+
+        Returns the :class:`RegistrarInfo` (also stored in *enum_result*
+        if provided).
+        """
+        if progress_cb:
+            progress_cb("Connecting to Jini Lookup Service via JVM bridge…")
+
+        inspector = RegistrarInspector(bridge)
+        timeout_ms = int(self.timeout * 1000)
+        info = inspector.inspect(host, port, timeout_ms=timeout_ms)
+
+        if enum_result is not None:
+            enum_result.registrar_info = info
+            if info.source == "jvm" and not info.error:
+                enum_result.tier = 3  # Tier 2 achieved
+
+        return info
 
     def collect_codebase_http_urls(self, enum_result: EnumResult) -> list[str]:
         """Return deduplicated HTTP/HTTPS base URLs to probe for codebase exploitation.

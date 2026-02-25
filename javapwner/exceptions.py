@@ -20,3 +20,7 @@ class PayloadError(JavaPwnerError):
 
 class NotJiniError(JavaPwnerError):
     """Raised when the target does not appear to be a Jini/Reggie service."""
+
+
+class JvmBridgeError(JavaPwnerError):
+    """Raised when the JVM bridge cannot operate (missing JDK, JARs, compile error)."""

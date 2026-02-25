@@ -26,6 +26,9 @@ javapwner = "javapwner.cli.main:cli"
 where = ["."]
 include = ["javapwner*"]
 
+[tool.setuptools.package-data]
+javapwner = ["../lib/*.java", "../lib/*.policy"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [

@@ -1,0 +1,14 @@
+/*
+ * Permissive security policy for JavaPwner's JiniInspector.
+ *
+ * This grants all permissions because:
+ *   1. We are a pentest tool — restrictive policies defeat the purpose.
+ *   2. Jini class loading (codebase) requires SocketPermission, etc.
+ *   3. We need to receive serialised proxy objects from the target.
+ *
+ * NEVER use this policy for production services.
+ */
+
+grant {
+    permission java.security.AllPermission;
+};
