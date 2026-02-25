@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import socket
+import struct
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -12,6 +14,22 @@ from javapwner.protocols.jini import jrmp, protocol
 
 DEFAULT_PORT = 4160
 _RECV_TIMEOUT = 3.0   # seconds to wait for first response byte
+
+
+@dataclass
+class MulticastDiscoveryResult:
+    """Result of an active Multicast Discovery Request."""
+    sent: bool = False
+    responders: list[dict[str, Any]] = field(default_factory=list)
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sent": self.sent,
+            "responder_count": len(self.responders),
+            "responders": self.responders,
+            "error": self.error,
+        }
 
 
 @dataclass
@@ -152,3 +170,103 @@ class JiniScanner:
                 result.udp_response = True
         except ConnectionError:
             pass
+
+    # ------------------------------------------------------------------
+    # Active Multicast Discovery
+    # ------------------------------------------------------------------
+
+    def multicast_discover(
+        self,
+        groups: list[str] | None = None,
+        wait: float = 3.0,
+    ) -> MulticastDiscoveryResult:
+        """Send a Multicast Discovery Request and collect unicast responses.
+
+        Opens a TCP server on a random port, sends a Multicast Request v1
+        datagram to ``224.0.1.85:4160`` advertising that port, then waits
+        up to *wait* seconds for Reggie instances to connect back and
+        deliver their Unicast Discovery responses.
+
+        Returns a :class:`MulticastDiscoveryResult` with one entry per
+        responding Reggie.
+        """
+        mdr = MulticastDiscoveryResult()
+        responders: list[dict[str, Any]] = []
+
+        # 1. Open a TCP server socket on a random port
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind(("0.0.0.0", 0))
+            srv.listen(16)
+            srv.settimeout(wait)
+            callback_port = srv.getsockname()[1]
+        except OSError as exc:
+            mdr.error = f"TCP listen failed: {exc}"
+            srv.close()
+            return mdr
+
+        # 2. Accept connections in a background thread
+        def _accept_loop() -> None:
+            while True:
+                try:
+                    conn, addr = srv.accept()
+                except (socket.timeout, OSError):
+                    break
+                try:
+                    conn.settimeout(self.timeout)
+                    data = b""
+                    while True:
+                        chunk = conn.recv(8192)
+                        if not chunk:
+                            break
+                        data += chunk
+                        if len(data) > 131072:
+                            break
+                    if data:
+                        entry: dict[str, Any] = {
+                            "source": f"{addr[0]}:{addr[1]}",
+                        }
+                        # Try parsing as v1 first, then v2
+                        parsed = protocol.parse_unicast_response_v1(data)
+                        if parsed["is_valid"]:
+                            entry["unicast_version"] = 1
+                            entry["groups"] = parsed["groups"]
+                            entry["fingerprint_strings"] = parsed["fingerprint_strings"]
+                        else:
+                            try:
+                                parsed = protocol.parse_unicast_response_v2(data)
+                                if parsed["is_valid"]:
+                                    entry["unicast_version"] = 2
+                                    entry["host"] = parsed.get("host")
+                                    entry["port"] = parsed.get("port")
+                                    entry["groups"] = parsed["groups"]
+                                    entry["fingerprint_strings"] = parsed["fingerprint_strings"]
+                            except ProtocolError:
+                                entry["raw_hex"] = data[:256].hex()
+                        responders.append(entry)
+                except Exception:
+                    pass
+                finally:
+                    conn.close()
+
+        accept_thread = threading.Thread(target=_accept_loop, daemon=True)
+        accept_thread.start()
+
+        # 3. Send multicast request
+        try:
+            request_data = protocol.build_multicast_request_v1(
+                callback_port=callback_port, groups=groups,
+            )
+            udp = UDPSession(timeout=2.0)
+            udp.send_multicast(request_data, group=JINI_MULTICAST_GROUP, port=DEFAULT_PORT)
+            mdr.sent = True
+        except ConnectionError as exc:
+            mdr.error = f"Multicast send failed: {exc}"
+
+        # 4. Wait for responses
+        accept_thread.join(timeout=wait + 1.0)
+        srv.close()
+
+        mdr.responders = responders
+        return mdr

@@ -79,6 +79,36 @@ def build_unicast_request_v2(format_ids: list[int] | None = None) -> bytes:
     return buf
 
 
+def build_multicast_request_v1(
+    callback_port: int,
+    groups: list[str] | None = None,
+) -> bytes:
+    """Build a Multicast Discovery Request v1 datagram.
+
+    The datagram is sent to 224.0.1.85:4160; any Reggie matching the
+    requested *groups* (empty list = "any group") responds via TCP to
+    the sender's IP on *callback_port*.
+
+    Wire format::
+
+        int32   protocol version = 1
+        int32   callback port (for unicast TCP response)
+        int32   count of known registrar ServiceIDs to exclude (0)
+        int32   count of group names (0 = any)
+        N × writeUTF  group name strings
+    """
+    if groups is None:
+        groups = []
+    buf = write_java_int(1)                # version
+    buf += write_java_int(callback_port)   # callback port
+    buf += write_java_int(0)               # no known service IDs to exclude
+    buf += write_java_int(len(groups))     # group count
+    for g in groups:
+        encoded = g.encode("utf-8")
+        buf += write_java_ushort(len(encoded)) + encoded
+    return buf
+
+
 # ---------------------------------------------------------------------------
 # Response parsers
 # ---------------------------------------------------------------------------

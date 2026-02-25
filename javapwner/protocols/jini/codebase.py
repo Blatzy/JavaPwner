@@ -23,6 +23,7 @@ for filesystem enumeration and arbitrary file reading.
 from __future__ import annotations
 
 import re
+import struct
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -120,6 +121,36 @@ class FileReadResult:
 
 
 @dataclass
+class ClassFileInfo:
+    """Metadata extracted from a downloaded ``.class`` file.
+
+    The constant pool is parsed to extract class names, interface names,
+    string literals, and method names — enough to understand what
+    Remote interfaces are available without a JVM.
+    """
+    url: str = ""
+    class_name: str = ""
+    super_class: str = ""
+    interfaces: list[str] = field(default_factory=list)
+    method_names: list[str] = field(default_factory=list)
+    string_constants: list[str] = field(default_factory=list)
+    field_names: list[str] = field(default_factory=list)
+    size: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "url": self.url,
+            "class_name": self.class_name,
+            "super_class": self.super_class,
+            "interfaces": self.interfaces,
+            "method_names": self.method_names,
+            "string_constants": self.string_constants[:50],
+            "field_names": self.field_names,
+            "size": self.size,
+        }
+
+
+@dataclass
 class CodebaseExploreResult:
     """Comprehensive result of HTTP codebase server exploitation."""
     base_url: str = ""
@@ -131,6 +162,7 @@ class CodebaseExploreResult:
     working_depth: int = 0
     readable_files: list[FileReadResult] = field(default_factory=list)
     probed_paths: list[dict[str, Any]] = field(default_factory=list)
+    downloaded_classes: list[ClassFileInfo] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -143,6 +175,7 @@ class CodebaseExploreResult:
             "working_depth": self.working_depth,
             "readable_files": [f.to_dict() for f in self.readable_files],
             "probed_paths": self.probed_paths,
+            "downloaded_classes": [c.to_dict() for c in self.downloaded_classes],
         }
 
 
@@ -214,6 +247,12 @@ class CodebaseExplorer:
         result.directory_listing = self._try_directory_listing(base_url)
         if result.directory_listing:
             self._progress(f"Directory listing: {len(result.directory_listing)} entries found")
+
+        # 2b. Download and parse .class files found in listing
+        class_entries = [e for e in result.directory_listing if e.endswith(".class")]
+        if class_entries:
+            self._progress(f"Found {len(class_entries)} .class files — downloading…")
+            result.downloaded_classes = self.download_classes(base_url, class_entries)
 
         # 3. Codebase-relative probes
         self._progress("Probing codebase paths...")
@@ -294,9 +333,202 @@ class CodebaseExplorer:
         base_url = self._normalize_url(base_url)
         return self._try_directory_listing(base_url + path.lstrip("/"))
 
+    def download_classes(
+        self, base_url: str, class_entries: list[str] | None = None,
+    ) -> list[ClassFileInfo]:
+        """Download ``.class`` files from *base_url* and parse them.
+
+        If *class_entries* is ``None``, a directory listing is fetched first
+        and all ``.class`` entries are downloaded.  Each downloaded file's
+        constant pool is parsed to extract class hierarchy, interfaces,
+        method names, fields, and string constants.
+        """
+        base_url = self._normalize_url(base_url)
+        if class_entries is None:
+            listing = self._try_directory_listing(base_url)
+            class_entries = [e for e in listing if e.endswith(".class")]
+        results: list[ClassFileInfo] = []
+        for entry in class_entries[:50]:  # cap to avoid huge downloads
+            url = base_url + entry.lstrip("/")
+            self._progress(f"Downloading class: {entry}")
+            res = self._fetch(url)
+            if res["success"] and res["body"][:4] == b"\xca\xfe\xba\xbe":
+                info = self._parse_class_file(res["body"])
+                info.url = url
+                info.size = len(res["body"])
+                results.append(info)
+                self._progress(
+                    f"Parsed {info.class_name}: "
+                    f"{len(info.interfaces)} ifaces, "
+                    f"{len(info.method_names)} methods"
+                )
+        return results
+
     # ------------------------------------------------------------------
     # Internal methods
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_class_file(data: bytes) -> ClassFileInfo:
+        """Parse a Java ``.class`` file and extract constant-pool metadata.
+
+        Implements enough of the JVM ClassFile spec (JVMS §4) to read:
+        - constant pool (Utf8, Class, NameAndType, String, Methodref, …)
+        - this_class, super_class, interfaces
+        - field names and method names
+
+        Does **not** execute anything — purely structural parsing.
+        """
+        info = ClassFileInfo()
+        try:
+            off = 8  # skip magic (4) + minor (2) + major (2)
+            (cp_count,) = struct.unpack_from(">H", data, off)
+            off += 2
+
+            # --- constant pool ---
+            cp: dict[int, Any] = {}
+            idx = 1
+            while idx < cp_count:
+                tag = data[off]
+                off += 1
+                if tag == 1:  # CONSTANT_Utf8
+                    (length,) = struct.unpack_from(">H", data, off)
+                    off += 2
+                    cp[idx] = ("Utf8", data[off:off + length].decode("utf-8", errors="replace"))
+                    off += length
+                elif tag == 3:  # CONSTANT_Integer
+                    cp[idx] = ("Integer",)
+                    off += 4
+                elif tag == 4:  # CONSTANT_Float
+                    cp[idx] = ("Float",)
+                    off += 4
+                elif tag == 5:  # CONSTANT_Long
+                    cp[idx] = ("Long",)
+                    off += 8
+                    idx += 1  # longs take two pool entries
+                elif tag == 6:  # CONSTANT_Double
+                    cp[idx] = ("Double",)
+                    off += 8
+                    idx += 1
+                elif tag == 7:  # CONSTANT_Class
+                    (name_idx,) = struct.unpack_from(">H", data, off)
+                    off += 2
+                    cp[idx] = ("Class", name_idx)
+                elif tag == 8:  # CONSTANT_String
+                    (str_idx,) = struct.unpack_from(">H", data, off)
+                    off += 2
+                    cp[idx] = ("String", str_idx)
+                elif tag == 9:  # CONSTANT_Fieldref
+                    off += 4
+                    cp[idx] = ("Fieldref",)
+                elif tag == 10:  # CONSTANT_Methodref
+                    off += 4
+                    cp[idx] = ("Methodref",)
+                elif tag == 11:  # CONSTANT_InterfaceMethodref
+                    off += 4
+                    cp[idx] = ("InterfaceMethodref",)
+                elif tag == 12:  # CONSTANT_NameAndType
+                    (name_idx, desc_idx) = struct.unpack_from(">HH", data, off)
+                    off += 4
+                    cp[idx] = ("NameAndType", name_idx, desc_idx)
+                elif tag == 15:  # CONSTANT_MethodHandle
+                    off += 3
+                    cp[idx] = ("MethodHandle",)
+                elif tag == 16:  # CONSTANT_MethodType
+                    off += 2
+                    cp[idx] = ("MethodType",)
+                elif tag == 17:  # CONSTANT_Dynamic
+                    off += 4
+                    cp[idx] = ("Dynamic",)
+                elif tag == 18:  # CONSTANT_InvokeDynamic
+                    off += 4
+                    cp[idx] = ("InvokeDynamic",)
+                elif tag == 19:  # CONSTANT_Module
+                    off += 2
+                    cp[idx] = ("Module",)
+                elif tag == 20:  # CONSTANT_Package
+                    off += 2
+                    cp[idx] = ("Package",)
+                else:
+                    break  # unknown tag — stop parsing
+                idx += 1
+
+            def _resolve_utf8(i: int) -> str:
+                entry = cp.get(i)
+                if entry and entry[0] == "Utf8":
+                    return entry[1]
+                return ""
+
+            def _resolve_class(i: int) -> str:
+                entry = cp.get(i)
+                if entry and entry[0] == "Class":
+                    return _resolve_utf8(entry[1]).replace("/", ".")
+                return ""
+
+            # --- access_flags (2) + this_class (2) + super_class (2) ---
+            off += 2  # access_flags
+            (this_idx, super_idx) = struct.unpack_from(">HH", data, off)
+            off += 4
+            info.class_name = _resolve_class(this_idx)
+            info.super_class = _resolve_class(super_idx)
+
+            # --- interfaces ---
+            (iface_count,) = struct.unpack_from(">H", data, off)
+            off += 2
+            for _ in range(iface_count):
+                (iface_idx,) = struct.unpack_from(">H", data, off)
+                off += 2
+                iname = _resolve_class(iface_idx)
+                if iname:
+                    info.interfaces.append(iname)
+
+            # --- fields ---
+            (field_count,) = struct.unpack_from(">H", data, off)
+            off += 2
+            for _ in range(field_count):
+                off += 2  # access_flags
+                (fname_idx,) = struct.unpack_from(">H", data, off)
+                off += 2
+                off += 2  # descriptor_index
+                (attr_count,) = struct.unpack_from(">H", data, off)
+                off += 2
+                fname = _resolve_utf8(fname_idx)
+                if fname:
+                    info.field_names.append(fname)
+                for _ in range(attr_count):
+                    off += 2  # attr name index
+                    (attr_len,) = struct.unpack_from(">I", data, off)
+                    off += 4 + attr_len
+
+            # --- methods ---
+            (method_count,) = struct.unpack_from(">H", data, off)
+            off += 2
+            for _ in range(method_count):
+                off += 2  # access_flags
+                (mname_idx,) = struct.unpack_from(">H", data, off)
+                off += 2
+                off += 2  # descriptor_index
+                (attr_count,) = struct.unpack_from(">H", data, off)
+                off += 2
+                mname = _resolve_utf8(mname_idx)
+                if mname and not mname.startswith("<"):
+                    info.method_names.append(mname)
+                for _ in range(attr_count):
+                    off += 2  # attr name index
+                    (attr_len,) = struct.unpack_from(">I", data, off)
+                    off += 4 + attr_len
+
+            # --- string constants (from constant pool) ---
+            for entry in cp.values():
+                if entry[0] == "String":
+                    val = _resolve_utf8(entry[1])
+                    if val and len(val) > 2:
+                        info.string_constants.append(val)
+
+        except (struct.error, IndexError, KeyError):
+            pass  # best-effort parsing
+
+        return info
 
     @staticmethod
     def _normalize_url(url: str) -> str:

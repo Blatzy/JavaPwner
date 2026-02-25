@@ -1,6 +1,6 @@
-"""JiniProbe — active probes for codebase URLs and embedded JRMP endpoints.
+"""JiniProbe — active probes for codebase URLs, JRMP endpoints, and DGC fingerprinting.
 
-Two probes are provided:
+Probes provided:
 
 * :class:`CodebaseProbeResult` / ``probe_codebase`` — extract all codebase URLs
   from the raw proxy blob, test HTTP/HTTPS reachability, and flag accessible
@@ -9,16 +9,26 @@ Two probes are provided:
 * :class:`EndpointProbeResult` / ``probe_endpoint`` — extract (host, port) hints
   from TCPEndpoint structures embedded in the serialised proxy, then confirm
   each candidate by attempting a real JRMP handshake.
+
+* :class:`DgcFingerprintResult` / ``probe_dgc`` — fingerprint DGC deserialization
+  filters (JEP 290) without requiring ysoserial.  Sends a crafted DGC dirty()
+  call with a ``java.util.HashMap`` payload and analyses the server response.
 """
 
 from __future__ import annotations
 
+import struct
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
 
 from javapwner.core.serialization import (
+    JAVA_SERIAL_HEADER,
+    TC_BLOCKDATA,
+    TC_EXCEPTION,
+    TC_OBJECT,
+    detect_exception_in_stream,
     extract_endpoint_hints,
     extract_raw_urls,
     find_nested_streams,
@@ -62,8 +72,51 @@ class EndpointProbeResult:
         }
 
 
+@dataclass
+class DgcFingerprintResult:
+    """Results of a DGC-based JEP 290 / deserialization filter fingerprint.
+
+    This probe does **not** require ysoserial — it crafts a minimal DGC
+    dirty() call embedding a ``java.util.HashMap`` instance and analyses
+    the server response.
+
+    Possible outcomes:
+
+    * ``jep290_active = True`` — the server rejected the HashMap with a
+      ``TC_EXCEPTION``, indicating that deserialization filters (JEP 290) are
+      installed on the DGC endpoint.  RCE via DGC dirty() is unlikely.
+    * ``jep290_active = False`` — the HashMap was **not** rejected.  The DGC
+      endpoint does **not** appear to filter deserialization, so ysoserial
+      payloads delivered via DGC dirty() should work.
+    * ``dgc_reachable = False`` — the DGC endpoint did not respond at all
+      (port filtered, timeout, or not a JRMP endpoint).
+    """
+
+    dgc_reachable: bool = False
+    jep290_active: bool | None = None  # None = unknown / unreachable
+    response_bytes: bytes = field(default=b"", repr=False)
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        status: str
+        if not self.dgc_reachable:
+            status = "unreachable"
+        elif self.jep290_active is True:
+            status = "filtered (JEP 290)"
+        elif self.jep290_active is False:
+            status = "unfiltered — RCE likely"
+        else:
+            status = "unknown"
+        return {
+            "dgc_reachable": self.dgc_reachable,
+            "jep290_active": self.jep290_active,
+            "status": status,
+            "error": self.error,
+        }
+
+
 class JiniProbe:
-    """Active probes for codebase URLs and embedded JRMP endpoints."""
+    """Active probes for codebase URLs, embedded JRMP endpoints, and DGC filters."""
 
     def __init__(self, timeout: float = 5.0):
         self.timeout = timeout
@@ -173,3 +226,120 @@ class JiniProbe:
                 continue
 
         return result
+
+    # ------------------------------------------------------------------
+    # DGC JEP 290 fingerprint
+    # ------------------------------------------------------------------
+
+    def probe_dgc(
+        self, host: str, port: int
+    ) -> DgcFingerprintResult:
+        """Fingerprint DGC deserialization filters — **no ysoserial required**.
+
+        Sends a DGC dirty() call containing a harmless
+        ``java.util.HashMap`` instance.  On a JEP-290-protected endpoint the
+        HashMap will be **rejected** by the built-in DGC filter and the server
+        responds with ``TC_EXCEPTION``.  On an unprotected endpoint the HashMap
+        passes through (dirty() raises an internal error *after*
+        deserialization).
+
+        This is the same technique used by *remote-method-guesser*'s
+        ``enum`` action ("RMI server JEP290 enumeration").
+        """
+        result = DgcFingerprintResult()
+
+        # Build a minimal Java serialised stream containing a HashMap
+        hashmap_payload = self._build_hashmap_payload()
+        dgc_call = jrmp.build_dgc_dirty_call(hashmap_payload)
+
+        try:
+            with TCPSession(host, port, timeout=self.timeout) as sess:
+                sess.send(jrmp.build_jrmp_handshake())
+                ack = sess.recv(256, exact=False)
+                if not ack:
+                    result.error = "No JRMP handshake response"
+                    return result
+
+                try:
+                    jrmp.parse_jrmp_ack(ack)
+                except Exception:
+                    result.error = "Invalid JRMP ack — not a JRMP endpoint"
+                    return result
+
+                result.dgc_reachable = True
+
+                sess.send(dgc_call)
+                response = sess.recv_all(timeout=_JRMP_TIMEOUT)
+                result.response_bytes = response
+
+                # Analyse the response
+                if detect_exception_in_stream(response):
+                    result.jep290_active = True
+                else:
+                    # No TC_EXCEPTION → the HashMap was *not* filtered.
+                    result.jep290_active = False
+
+        except ConnectionError as exc:
+            result.error = f"Connection failed: {exc}"
+        except Exception as exc:  # noqa: BLE001
+            result.error = f"Unexpected error: {exc}"
+
+        return result
+
+    @staticmethod
+    def _build_hashmap_payload() -> bytes:
+        """Build a minimal Java serialised ``java.util.HashMap``.
+
+        This is a well-formed, self-contained ``ObjectOutputStream`` that
+        contains an empty HashMap.  It is used as a deserialization probe:
+        the DGC filter blocks it on JEP-290 endpoints, but it is completely
+        harmless on unprotected endpoints.
+
+        Wire format (hex)::
+
+            AC ED 00 05          → stream magic + version
+            73                   → TC_OBJECT
+            72                   → TC_CLASSDESC
+            00 12                → class name length = 18
+            6A 61 76 61 ...      → "java.util.HashMap"
+            05 07 DA C1 C3 16 60 D1  → serialVersionUID
+            03                   → SC_WRITE_METHOD | SC_SERIALIZABLE
+            00 02                → 2 fields
+            46 00 0A             → float "loadFactor"
+            6C 6F 61 64 46 61 63 74 6F 72
+            49 00 09             → int "threshold"
+            74 68 72 65 73 68 6F 6C 64
+            78 70               → TC_ENDBLOCKDATA + TC_NULL (superclass)
+            3F 40 00 00          → loadFactor = 0.75
+            00 00 00 00          → threshold = 0
+            77 08                → TC_BLOCKDATA, length = 8
+            00 00 00 10          → capacity = 16
+            00 00 00 00          → size = 0
+            78                   → TC_ENDBLOCKDATA
+        """
+        return bytes.fromhex(
+            "aced0005"              # STREAM_MAGIC + STREAM_VERSION
+            "73"                    # TC_OBJECT
+            "72"                    # TC_CLASSDESC
+            "0012"                  # length=18
+            "6a6176612e7574696c"    # "java.util"
+            "2e486173684d6170"      # ".HashMap"
+            "0507dac1c31660d1"      # serialVersionUID
+            "03"                    # flags: SC_WRITE_METHOD | SC_SERIALIZABLE
+            "0002"                  # 2 fields
+            # field 1: float loadFactor
+            "46"                    # 'F' — float
+            "000a"                  # length=10
+            "6c6f6164466163746f72"  # "loadFactor"
+            # field 2: int threshold
+            "49"                    # 'I' — int
+            "0009"                  # length=9
+            "7468726573686f6c64"    # "threshold"
+            "7870"                  # TC_ENDBLOCKDATA + TC_NULL (no superclass)
+            "3f400000"              # loadFactor = 0.75f
+            "00000000"              # threshold = 0
+            "7708"                  # TC_BLOCKDATA (8 bytes)
+            "00000010"              # capacity = 16
+            "00000000"              # size = 0
+            "78"                    # TC_ENDBLOCKDATA
+        )

@@ -19,7 +19,7 @@ from javapwner.protocols.jini.codebase import CodebaseExplorer
 from javapwner.protocols.jini.enumerator import JiniEnumerator
 from javapwner.protocols.jini.exploiter import JiniExploiter
 from javapwner.protocols.jini.probe import JiniProbe
-from javapwner.protocols.jini.scanner import JiniScanner
+from javapwner.protocols.jini.scanner import JiniScanner, MulticastDiscoveryResult
 
 DEFAULT_PORT = 4160
 
@@ -70,12 +70,21 @@ def _scan_cmd_json(
     except JavaPwnerError:
         pass
 
+    dgc_result = None
+    try:
+        probe = JiniProbe(timeout=timeout)
+        dgc_result = probe.probe_dgc(target, port)
+    except JavaPwnerError:
+        pass
+
     out: dict = {
         "scan": scan_result.to_dict(),
         "enum": enum_result.to_dict(),
     }
     if ep_result:
         out["probe_endpoint"] = ep_result.to_dict()
+    if dgc_result:
+        out["dgc_fingerprint"] = dgc_result.to_dict()
     fmt.print_json(out)
 
 
@@ -202,6 +211,11 @@ def scan_cmd(ctx: click.Context, target: str, port: int, no_codebase: bool) -> N
             fmt.info("System information extracted:")
             fmt.print_system_info(si)
 
+    if enum_result.java_version_hints:
+        fmt.info("Java version hints (from serial UIDs):")
+        for hint in enum_result.java_version_hints:
+            fmt.success(f"  {hint['class']}  SUID={hint['suid']} → {hint['hint']}")
+
     if enum_result.embedded_endpoints:
         fmt.info(f"Embedded endpoints ({len(enum_result.embedded_endpoints)}):")
         for ep in enum_result.embedded_endpoints:
@@ -233,6 +247,24 @@ def scan_cmd(ctx: click.Context, target: str, port: int, no_codebase: bool) -> N
     else:
         fmt.info("No additional JRMP endpoints discovered.")
 
+    # DGC fingerprint (harmless HashMap — no ysoserial needed)
+    try:
+        probe = JiniProbe(timeout=timeout)
+        with fmt.status("Probing DGC deserialization filters (JEP 290)…"):
+            dgc_result = probe.probe_dgc(target, port)
+        d = dgc_result.to_dict()
+        status_str = d.get("status", "unknown")
+        if dgc_result.jep290_active is False:
+            fmt.success(f"DGC JEP 290   : {status_str}")
+        elif dgc_result.jep290_active is True:
+            fmt.warning(f"DGC JEP 290   : {status_str}")
+        elif dgc_result.dgc_reachable:
+            fmt.info(f"DGC JEP 290   : {status_str}")
+        else:
+            fmt.info(f"DGC JEP 290   : {status_str}")
+    except JavaPwnerError:
+        fmt.info("DGC JEP 290   : probe failed")
+
     # ── Phase 4: HTTP codebase exploitation (per-URL, progressive) ───────────
     if no_codebase:
         if scan_result.raw_proxy_bytes:
@@ -257,6 +289,19 @@ def scan_cmd(ctx: click.Context, target: str, port: int, no_codebase: bool) -> N
 
             # Print this URL's results immediately
             fmt.print_codebase_exploit(exploit.to_dict())
+
+            # Show downloaded class file analysis
+            if exploit.downloaded_classes:
+                fmt.info(f"  Downloaded .class files ({len(exploit.downloaded_classes)}):")
+                for cls_info in exploit.downloaded_classes:
+                    ifaces = ", ".join(cls_info.interfaces) if cls_info.interfaces else "(none)"
+                    methods = ", ".join(cls_info.method_names[:10]) if cls_info.method_names else "(none)"
+                    fmt.success(f"    {cls_info.class_name}")
+                    fmt.info(f"      extends  : {cls_info.super_class}")
+                    fmt.info(f"      implements: {ifaces}")
+                    fmt.info(f"      methods  : {methods}")
+                    if cls_info.field_names:
+                        fmt.info(f"      fields   : {', '.join(cls_info.field_names[:10])}")
 
     # Hex dump at the very end
     if scan_result.raw_proxy_bytes:

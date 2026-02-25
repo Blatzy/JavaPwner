@@ -34,6 +34,7 @@ from javapwner.core.serialization import (
     extract_strings_from_stream,
     extract_system_info,
     find_nested_streams,
+    fingerprint_java_version,
     get_stream_metadata,
     parse_class_descriptors,
 )
@@ -66,6 +67,7 @@ class EnumResult:
     serial_version_uids: dict[str, int] = field(default_factory=dict)
     file_paths: list[str] = field(default_factory=list)
     system_info: dict[str, Any] = field(default_factory=dict)
+    java_version_hints: list[dict[str, str]] = field(default_factory=list)
 
     # --- Tier 1++ (HTTP codebase exploitation) ---
     codebase_exploits: list[CodebaseExploreResult] = field(default_factory=list)
@@ -88,6 +90,7 @@ class EnumResult:
             "serial_version_uids": self.serial_version_uids,
             "file_paths": self.file_paths,
             "system_info": self.system_info,
+            "java_version_hints": self.java_version_hints,
             # Codebase exploitation
             "codebase_exploits": [e.to_dict() for e in self.codebase_exploits],
         }
@@ -182,6 +185,12 @@ class JiniEnumerator:
                 result.proxy_interfaces.extend(desc["interfaces"])
             elif desc["type"] == "class":
                 result.serial_version_uids[desc["name"]] = desc["uid"]
+
+        # Java version fingerprinting from serial UIDs
+        if result.serial_version_uids:
+            result.java_version_hints = fingerprint_java_version(
+                result.serial_version_uids
+            )
 
         result.tier = 2  # Tier 1+ achieved
 
