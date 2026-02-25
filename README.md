@@ -5,7 +5,7 @@ Python pentest toolkit targeting Java middleware protocols. Starts with Apache R
 ## Requirements
 
 - Python 3.10+
-- Java JRE (for payload generation)
+- Java JDK (pour compilation et exécution — `java` + `javac`)
 - [ysoserial-all.jar](https://github.com/frohoff/ysoserial/releases) → place as `lib/ysoserial.jar`
 
 ## Install
@@ -18,11 +18,14 @@ pip install -e .
 ## Usage
 
 ```bash
-# Scan
+# Scan (Tier 1 — heuristique, sans JVM)
 javapwner jini scan -t 192.168.1.10
 
-# Enumerate services (heuristic)
-javapwner jini enum -t 192.168.1.10 --verbose
+# Scan avec inspection Tier 2 (nécessite JDK + JARs River, voir ci-dessous)
+javapwner jini scan -t 192.168.1.10 --tier2
+
+# Inspection admin dédiée (Tier 2)
+javapwner jini admin -t 192.168.1.10
 
 # List available gadgets
 javapwner jini gadgets
@@ -36,6 +39,70 @@ javapwner jini exploit -t 192.168.1.10 --gadget URLDNS --cmd http://cb.burpcolla
 ```
 
 Global flags: `--verbose`, `--json`, `--timeout`, `--ysoserial <path>`
+
+## Tier 2 — Setup JVM Bridge (Kali Linux)
+
+Le Tier 2 permet de se connecter réellement au Registrar Jini pour :
+- Vérifier si le Registrar est `Administrable` (appel `getAdmin()`)
+- Détecter les capacités admin : `JoinAdmin`, `DestroyAdmin`, `StorageLocationAdmin`
+- Lister tous les services enregistrés dans le Lookup Service
+
+### 1. Installer le JDK
+
+```bash
+sudo apt update && sudo apt install -y default-jdk
+```
+
+Vérifier :
+
+```bash
+java -version && javac -version
+```
+
+### 2. Télécharger Apache River
+
+```bash
+cd /tmp
+wget https://archive.apache.org/dist/river/river-3.0.0/apache-river-3.0.0-src.tar.gz
+tar xzf apache-river-3.0.0-src.tar.gz
+```
+
+### 3. Copier les JARs nécessaires dans `lib/`
+
+Seuls deux JARs sont requis (`jsk-lib.jar` et `jsk-platform.jar`) :
+
+```bash
+# Depuis le répertoire du projet JavaPwner :
+cp /tmp/apache-river-3.0.0/lib/jsk-lib.jar lib/
+cp /tmp/apache-river-3.0.0/lib/jsk-platform.jar lib/
+```
+
+> **Alternative** : si les JARs ne sont pas dans le bundle source, télécharger directement depuis Maven Central :
+>
+> ```bash
+> cd lib/
+> wget https://repo1.maven.org/maven2/org/apache/river/jsk-lib/3.0.0/jsk-lib-3.0.0.jar -O jsk-lib.jar
+> wget https://repo1.maven.org/maven2/org/apache/river/jsk-platform/3.0.0/jsk-platform-3.0.0.jar -O jsk-platform.jar
+> ```
+
+### 4. Vérifier le setup
+
+```bash
+javapwner jini admin -t 192.168.1.10
+```
+
+Si les prérequis sont manquants, l'outil affiche un message d'erreur explicite indiquant ce qui manque.
+
+### Configuration avancée
+
+Au lieu de copier les JARs dans `lib/`, vous pouvez utiliser :
+
+| Méthode | Exemple |
+|---|---|
+| Flag `--classpath` | `javapwner jini scan -t HOST --tier2 --classpath /opt/river/lib/jsk-lib.jar:/opt/river/lib/jsk-platform.jar` |
+| Variable `JINI_CLASSPATH` | `export JINI_CLASSPATH=/opt/river/lib/jsk-lib.jar:/opt/river/lib/jsk-platform.jar` |
+| Variable `RIVER_HOME` | `export RIVER_HOME=/opt/river` (cherche automatiquement dans `lib/`) |
+| Variable `JAVA_HOME` | `export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64` |
 
 ## Tests
 
