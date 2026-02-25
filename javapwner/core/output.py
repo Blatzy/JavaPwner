@@ -282,3 +282,64 @@ class OutputFormatter:
                 expand=False,
             )
         )
+
+    def print_assessment(self, assessment: dict[str, Any]) -> None:
+        """Print an exploitation assessment with coloured risk panel."""
+        if self.json_mode:
+            self.print_json(assessment)
+            return
+
+        risk = assessment.get("risk_level", "INFO")
+        risk_colors = {
+            "CRITICAL": "bold red",
+            "HIGH": "red",
+            "MEDIUM": "yellow",
+            "LOW": "cyan",
+            "INFO": "dim",
+        }
+        risk_style = risk_colors.get(risk, "dim")
+
+        # Header
+        self._console.print()
+        jdk = assessment.get("jdk_estimate", "unknown")
+        fw = assessment.get("framework", "unknown")
+        dgc = assessment.get("dgc_state", "unknown")
+        confidence = assessment.get("jdk_confidence", "none")
+
+        lines = Text()
+        lines.append(f"Risk Level  : ", style="bold")
+        lines.append(f"{risk}\n", style=risk_style)
+        lines.append(f"JDK Version : ", style="bold")
+        lines.append(f"{jdk}", style="cyan")
+        lines.append(f" (confidence: {confidence})\n", style="dim")
+        lines.append(f"Framework   : ", style="bold")
+        lines.append(f"{fw}\n", style="cyan")
+        lines.append(f"DGC State   : ", style="bold")
+        dgc_style = "green" if dgc == "unfiltered" else "yellow" if dgc == "filtered" else "dim"
+        lines.append(f"{dgc}", style=dgc_style)
+
+        self._console.print(Panel(
+            lines,
+            title="[bold]Exploitation Assessment[/bold]",
+            border_style=risk_style,
+            expand=False,
+        ))
+
+        # Attack vectors
+        vectors = assessment.get("vectors", [])
+        if not vectors:
+            self._console.print("  [dim]No specific attack vectors identified.[/dim]")
+            return
+
+        for i, v in enumerate(vectors, 1):
+            sev = v.get("severity", "INFO")
+            sev_style = risk_colors.get(sev, "dim")
+            self._console.print(
+                f"\n  [{sev_style}][{sev}][/{sev_style}] "
+                f"[bold]{v.get('title', '?')}[/bold]"
+            )
+            self._console.print(f"    {v.get('detail', '')}")
+            action = v.get("action", "")
+            if action:
+                for line in action.split("\n"):
+                    self._console.print(f"    [green]→ {line}[/green]")

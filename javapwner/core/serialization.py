@@ -60,62 +60,65 @@ _JAVA_PROP_RE = re.compile(
 # ---------------------------------------------------------------------------
 # Java version fingerprinting via serial version UIDs
 # ---------------------------------------------------------------------------
-# Standard JDK classes have well-known serialVersionUID values that change
-# across major Java versions.  Matching the UID of a class found inside a
-# serialized stream lets us fingerprint the JDK version that produced it.
+# Standard JDK classes have well-known serialVersionUID values.  Most SUIDs
+# have been **stable since JDK 1.1** and therefore do NOT discriminate
+# versions.  Only a handful of SUIDs actually changed across major JDK
+# boundaries — those are the only ones useful for version pinpointing.
 #
-# Each entry maps class_name -> {suid: "version_hint"}.
-# UIDs are signed 64-bit (as read from TC_CLASSDESC).
+# DB structure: class_name -> {suid: (hint_text, discriminating: bool)}
+#   discriminating=True  → this SUID **pins** the version range
+#   discriminating=False → SUID is stable; confirms class presence only
 
-_SUID_FINGERPRINT_DB: dict[str, dict[int, str]] = {
-    # java.rmi.MarshalledObject — changed in JDK 8→ JDK 9
+_SUID_FINGERPRINT_DB: dict[str, dict[int, tuple[str, bool]]] = {
+    # ──────────────── DISCRIMINATING entries ────────────────────────────────
+    # java.rmi.MarshalledObject — THE key discriminator: SUID changed JDK 9
     "java.rmi.MarshalledObject": {
-        7834398015428807710: "JDK 1.2 – 8",
-        -4768799335562104920: "JDK 9+",
+        7834398015428807710:  ("JDK ≤ 8 (pre-JEP 290)", True),
+        -4768799335562104920: ("JDK 9+", True),
     },
-    # sun.rmi.server.UnicastRef — present on v1 endpoints
-    "sun.rmi.server.UnicastRef": {
-        -2923896440498087721: "JDK 1.2+",
-    },
-    # sun.rmi.server.UnicastRef2
-    "sun.rmi.server.UnicastRef2": {
-        1829537514995881838: "JDK 1.2+",
-    },
-    # net.jini.core.lookup.ServiceID / ServiceRegistrar proxy UIDs
-    "net.jini.core.lookup.ServiceID": {
-        -7803375959559762239: "Jini 2.0+",
-    },
-    # com.sun.jini.reggie.RegistrarProxy — common Reggie proxy
+    # com.sun.jini.reggie.RegistrarProxy — old Sun Jini namespace
+    # Proves the deployment uses pre-Apache-River Jini (Sun-era).
+    # Typically runs on JDK 5–8 and predates JEP 290 hardening.
     "com.sun.jini.reggie.RegistrarProxy": {
-        2: "Jini 2.0 / River 2.x",
+        2: ("Sun Jini 2.x / River 2.x (com.sun namespace → likely JDK ≤ 8)", True),
     },
-    # org.apache.river.reggie.RegistrarProxy
+    # org.apache.river.reggie.RegistrarProxy — Apache River 3.x namespace
     "org.apache.river.reggie.RegistrarProxy": {
-        2: "River 3.x",
+        2: ("Apache River 3.x (may run on JDK 9+)", True),
     },
-    # java.util.HashMap
+    # java.lang.invoke.SerializedLambda — only exists JDK 8+
+    "java.lang.invoke.SerializedLambda": {
+        8025925345765570181: ("JDK 8+", True),
+    },
+    # ──────────────── PRESENCE-ONLY entries (stable SUIDs) ─────────────────
+    # These confirm the class exists but the SUID is the same across all
+    # JDK versions — they do NOT help narrow down the version.
+    "sun.rmi.server.UnicastRef": {
+        -2923896440498087721: ("RMI UnicastRef present (SUID stable since JDK 1.2)", False),
+    },
+    "sun.rmi.server.UnicastRef2": {
+        1829537514995881838: ("RMI UnicastRef2 present (SUID stable since JDK 1.2)", False),
+    },
+    "net.jini.core.lookup.ServiceID": {
+        -7803375959559762239: ("Jini ServiceID present (SUID stable since Jini 2.0)", False),
+    },
     "java.util.HashMap": {
-        362498820763181265: "JDK 1.2+",
+        362498820763181265: ("HashMap present (SUID stable since JDK 1.2)", False),
     },
-    # java.util.ArrayList
     "java.util.ArrayList": {
-        8683452581122892189: "JDK 1.2+",
+        8683452581122892189: ("ArrayList present (SUID stable since JDK 1.2)", False),
     },
-    # java.lang.reflect.Proxy (dynamic proxy)
     "java.lang.reflect.Proxy": {
-        -2222568056686623797: "JDK 1.3+",
+        -2222568056686623797: ("Dynamic proxy present (SUID stable since JDK 1.3)", False),
     },
-    # java.rmi.server.RemoteObject
     "java.rmi.server.RemoteObject": {
-        -3215090123894869218: "JDK 1.1+",
+        -3215090123894869218: ("RemoteObject present (SUID stable since JDK 1.1)", False),
     },
-    # java.rmi.server.RemoteServer
     "java.rmi.server.RemoteServer": {
-        -4100238210092549637: "JDK 1.1+",
+        -4100238210092549637: ("RemoteServer present (SUID stable since JDK 1.1)", False),
     },
-    # java.rmi.server.UnicastRemoteObject
     "java.rmi.server.UnicastRemoteObject": {
-        4974527148936298033: "JDK 1.1+",
+        4974527148936298033: ("UnicastRemoteObject present (SUID stable since JDK 1.1)", False),
     },
 }
 
@@ -126,22 +129,32 @@ def fingerprint_java_version(serial_uids: dict[str, int]) -> list[dict[str, str]
     *serial_uids* should be ``{class_name: suid}`` as returned by
     :func:`parse_class_descriptors`.
 
-    Returns a list of ``{"class": ..., "suid": ..., "hint": ...}`` dicts.
+    Returns a list of ``{"class": ..., "suid": ..., "hint": ...,
+    "discriminating": True/False}`` dicts, sorted with discriminating
+    entries first.
     """
     hits: list[dict[str, str]] = []
     for cls_name, uid in serial_uids.items():
         db_entry = _SUID_FINGERPRINT_DB.get(cls_name)
         if db_entry:
-            hint = db_entry.get(uid)
-            if hint:
-                hits.append({"class": cls_name, "suid": str(uid), "hint": hint})
-            else:
-                # Unknown SUID for a known class → report as interesting
+            match = db_entry.get(uid)
+            if match:
+                hint_text, discriminating = match
                 hits.append({
                     "class": cls_name,
                     "suid": str(uid),
-                    "hint": f"unknown SUID (not in fingerprint DB)",
+                    "hint": hint_text,
+                    "discriminating": str(discriminating),
                 })
+            else:
+                hits.append({
+                    "class": cls_name,
+                    "suid": str(uid),
+                    "hint": "unknown SUID (not in fingerprint DB — may indicate unusual JDK)",
+                    "discriminating": "True",  # unknown SUID IS interesting
+                })
+    # Sort: discriminating entries first
+    hits.sort(key=lambda h: h["discriminating"] != "True")
     return hits
 
 

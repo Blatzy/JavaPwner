@@ -15,6 +15,7 @@ import click
 
 from javapwner.core.output import OutputFormatter
 from javapwner.exceptions import JavaPwnerError, PayloadError
+from javapwner.protocols.jini.assessment import assess_exploitation
 from javapwner.protocols.jini.codebase import CodebaseExplorer
 from javapwner.protocols.jini.enumerator import JiniEnumerator
 from javapwner.protocols.jini.exploiter import JiniExploiter
@@ -77,9 +78,21 @@ def _scan_cmd_json(
     except JavaPwnerError:
         pass
 
+    assessment = assess_exploitation(
+        version_hints=enum_result.java_version_hints,
+        dgc_reachable=dgc_result.dgc_reachable if dgc_result else False,
+        jep290_active=dgc_result.jep290_active if dgc_result else None,
+        class_names=enum_result.extracted_classes,
+        codebase_results=[e.to_dict() for e in enum_result.codebase_exploits],
+        proxy_interfaces=enum_result.proxy_interfaces,
+        target=target,
+        port=port,
+    )
+
     out: dict = {
         "scan": scan_result.to_dict(),
         "enum": enum_result.to_dict(),
+        "assessment": assessment.to_dict(),
     }
     if ep_result:
         out["probe_endpoint"] = ep_result.to_dict()
@@ -212,9 +225,16 @@ def scan_cmd(ctx: click.Context, target: str, port: int, no_codebase: bool) -> N
             fmt.print_system_info(si)
 
     if enum_result.java_version_hints:
-        fmt.info("Java version hints (from serial UIDs):")
-        for hint in enum_result.java_version_hints:
-            fmt.success(f"  {hint['class']}  SUID={hint['suid']} → {hint['hint']}")
+        disc = [h for h in enum_result.java_version_hints if h.get("discriminating") == "True"]
+        pres = [h for h in enum_result.java_version_hints if h.get("discriminating") != "True"]
+        if disc:
+            fmt.info("Version-discriminating fingerprints:")
+            for hint in disc:
+                fmt.success(f"  {hint['class']}  SUID={hint['suid']} → {hint['hint']}")
+        if pres and fmt.verbose:
+            fmt.info("Presence confirmations (stable SUIDs — not version-discriminating):")
+            for hint in pres:
+                fmt.debug(f"  {hint['class']}  SUID={hint['suid']} → {hint['hint']}")
 
     if enum_result.embedded_endpoints:
         fmt.info(f"Embedded endpoints ({len(enum_result.embedded_endpoints)}):")
@@ -248,6 +268,7 @@ def scan_cmd(ctx: click.Context, target: str, port: int, no_codebase: bool) -> N
         fmt.info("No additional JRMP endpoints discovered.")
 
     # DGC fingerprint (harmless HashMap — no ysoserial needed)
+    dgc_result = None
     try:
         probe = JiniProbe(timeout=timeout)
         with fmt.status("Probing DGC deserialization filters (JEP 290)…"):
@@ -266,42 +287,68 @@ def scan_cmd(ctx: click.Context, target: str, port: int, no_codebase: bool) -> N
         fmt.info("DGC JEP 290   : probe failed")
 
     # ── Phase 4: HTTP codebase exploitation (per-URL, progressive) ───────────
+    codebase_exploits: list = []  # collect for assessment
+
     if no_codebase:
-        if scan_result.raw_proxy_bytes:
-            fmt.print_hex_dump(scan_result.raw_proxy_bytes, label="Raw proxy bytes")
-        return
-
-    fmt.section("Phase 4 — HTTP Codebase Exploitation")
-    http_urls = enumerator.collect_codebase_http_urls(enum_result)
-
-    if not http_urls:
-        fmt.info("No HTTP codebase URLs found to probe.")
+        fmt.info("Codebase probing skipped (--no-codebase).")
     else:
-        for base_url in http_urls:
-            fmt.info(f"Probing codebase server: {base_url}")
+        fmt.section("Phase 4 — HTTP Codebase Exploitation")
+        http_urls = enumerator.collect_codebase_http_urls(enum_result)
 
-            def _progress_cb(msg: str, _url: str = base_url) -> None:  # noqa: ANN001
-                fmt.debug(f"  [{_url}] {msg}")
+        if not http_urls:
+            fmt.info("No HTTP codebase URLs found to probe.")
+        else:
+            for base_url in http_urls:
+                fmt.info(f"Probing codebase server: {base_url}")
 
-            explorer = CodebaseExplorer(timeout=timeout, progress_cb=_progress_cb)
-            with fmt.status(f"Probing {base_url}…"):
-                exploit = explorer.explore(base_url)
+                def _progress_cb(msg: str, _url: str = base_url) -> None:  # noqa: ANN001
+                    fmt.debug(f"  [{_url}] {msg}")
 
-            # Print this URL's results immediately
-            fmt.print_codebase_exploit(exploit.to_dict())
+                explorer = CodebaseExplorer(timeout=timeout, progress_cb=_progress_cb)
+                with fmt.status(f"Probing {base_url}…"):
+                    exploit = explorer.explore(base_url)
 
-            # Show downloaded class file analysis
-            if exploit.downloaded_classes:
-                fmt.info(f"  Downloaded .class files ({len(exploit.downloaded_classes)}):")
-                for cls_info in exploit.downloaded_classes:
-                    ifaces = ", ".join(cls_info.interfaces) if cls_info.interfaces else "(none)"
-                    methods = ", ".join(cls_info.method_names[:10]) if cls_info.method_names else "(none)"
-                    fmt.success(f"    {cls_info.class_name}")
-                    fmt.info(f"      extends  : {cls_info.super_class}")
-                    fmt.info(f"      implements: {ifaces}")
-                    fmt.info(f"      methods  : {methods}")
-                    if cls_info.field_names:
-                        fmt.info(f"      fields   : {', '.join(cls_info.field_names[:10])}")
+                codebase_exploits.append(exploit)
+
+                # Print this URL's results immediately
+                fmt.print_codebase_exploit(exploit.to_dict())
+
+                # Show downloaded class file analysis
+                if exploit.downloaded_classes:
+                    fmt.info(f"  Downloaded .class files ({len(exploit.downloaded_classes)}):")
+                    for cls_info in exploit.downloaded_classes:
+                        ifaces = ", ".join(cls_info.interfaces) if cls_info.interfaces else "(none)"
+                        methods = ", ".join(cls_info.method_names[:10]) if cls_info.method_names else "(none)"
+                        fmt.success(f"    {cls_info.class_name}")
+                        fmt.info(f"      extends  : {cls_info.super_class}")
+                        fmt.info(f"      implements: {ifaces}")
+                        fmt.info(f"      methods  : {methods}")
+                        if cls_info.field_names:
+                            fmt.info(f"      fields   : {', '.join(cls_info.field_names[:10])}")
+
+    # ── Phase 5: Exploitation Assessment ────────────────────────────────────
+    fmt.section("Phase 5 — Exploitation Assessment")
+
+    # Collect DGC state from the Phase 3 probe
+    _dgc_reachable = False
+    _jep290_active: bool | None = None
+    try:
+        _dgc_reachable = dgc_result.dgc_reachable  # type: ignore[union-attr]
+        _jep290_active = dgc_result.jep290_active  # type: ignore[union-attr]
+    except AttributeError:
+        pass
+
+    assessment = assess_exploitation(
+        version_hints=enum_result.java_version_hints,
+        dgc_reachable=_dgc_reachable,
+        jep290_active=_jep290_active,
+        class_names=enum_result.extracted_classes,
+        codebase_results=[e.to_dict() for e in codebase_exploits],
+        proxy_interfaces=enum_result.proxy_interfaces,
+        target=target,
+        port=port,
+    )
+    fmt.print_assessment(assessment.to_dict())
 
     # Hex dump at the very end
     if scan_result.raw_proxy_bytes:

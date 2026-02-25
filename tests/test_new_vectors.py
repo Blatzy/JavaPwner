@@ -28,7 +28,7 @@ class TestFingerprintJavaVersion:
         uids = {"java.rmi.MarshalledObject": 7834398015428807710}
         hints = fingerprint_java_version(uids)
         assert len(hints) == 1
-        assert hints[0]["hint"] == "JDK 1.2 – 8"
+        assert "JDK ≤ 8" in hints[0]["hint"]
 
     def test_known_jdk9_marshalled_object(self):
         uids = {"java.rmi.MarshalledObject": -4768799335562104920}
@@ -61,6 +61,7 @@ class TestFingerprintJavaVersion:
         hints = fingerprint_java_version(uids)
         assert len(hints) == 1
         assert "River 3" in hints[0]["hint"]
+        assert hints[0]["discriminating"] == "True"
 
 
 # -----------------------------------------------------------------------
