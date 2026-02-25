@@ -315,14 +315,16 @@ class JvmBridge:
             "-cp", self.classpath,
         ]
 
-        # Security policy (if present)
+        # Security policy for RMI codebase class loading.
+        # On Java 24+ SecurityManager is permanently disabled — the flags
+        # are harmless no-ops and JiniInspector catches the exception.
+        # Proxy classes (reggie-dl.jar) on the local classpath provide
+        # a fallback that works on ALL Java versions.
         if _SECURITY_POLICY.is_file():
             cmd.append(f"-Djava.security.policy={_SECURITY_POLICY}")
-
-        # Allow codebase class loading from target
         cmd.append("-Djava.rmi.server.useCodebaseOnly=false")
-
-        # Disable the security manager entirely on Java 17+ (deprecated)
+        # 'allow' lets JiniInspector call System.setSecurityManager()
+        # on Java 17-23; ignored on < 17, harmless on 24+.
         cmd.append("-Djava.security.manager=allow")
 
         cmd.extend(["JiniInspector", host, str(port), str(timeout_ms)])

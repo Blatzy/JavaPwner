@@ -50,6 +50,21 @@ public class JiniInspector {
     private static final int MAX_SERVICES = 256;
 
     public static void main(String[] args) {
+        // Install a SecurityManager to enable RMI codebase class loading.
+        // On Java 21+ SecurityManager has been removed — catch and continue;
+        // the necessary proxy classes (reggie-dl.jar) should be on the local
+        // classpath instead.
+        try {
+            if (System.getSecurityManager() == null) {
+                System.setSecurityManager(new SecurityManager());
+            }
+        } catch (UnsupportedOperationException ignored) {
+            // Java 21+: SecurityManager removed entirely — not needed when
+            // proxy JARs (reggie*.jar) are on the classpath.
+        } catch (SecurityException ignored) {
+            // Already managed or not permitted.
+        }
+
         if (args.length < 2) {
             outputError("Usage: JiniInspector <host> <port> [timeout_ms]");
             System.exit(1);
