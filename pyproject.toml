@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "javapwner"
+version = "0.1.0"
+description = "Python pentest toolkit targeting Java middleware protocols"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.0",
+    "rich>=13.0",
+    "javaobj-py3>=0.4.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-mock>=3.0",
+]
+
+[project.scripts]
+javapwner = "javapwner.cli.main:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["javapwner*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "live: marks tests as requiring a live Jini/Reggie target",
+]
