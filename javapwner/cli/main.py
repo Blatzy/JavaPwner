@@ -2,7 +2,7 @@
 
 import click
 
-from javapwner.cli import jini_cmds
+from javapwner.cli import jini_cmds, rmi_cmds, jboss_cmds
 from javapwner.core.output import OutputFormatter
 
 
@@ -34,30 +34,5 @@ def cli(ctx: click.Context, verbose: bool, json_mode: bool,
 
 
 cli.add_command(jini_cmds.jini)
-
-
-# Stub groups for future modules
-@cli.group()
-def rmi() -> None:
-    """RMI/JMX protocol commands (stub)."""
-
-
-@rmi.command("scan")
-@click.option("-t", "--target", required=True, metavar="HOST")
-@click.option("-p", "--port", default=8282, show_default=True, type=int)
-def rmi_scan(target: str, port: int) -> None:
-    """Scan a Java RMI/JMX endpoint (not yet implemented)."""
-    click.echo("[!] RMI scanner is not yet implemented.")
-
-
-@cli.group()
-def jboss() -> None:
-    """JBoss protocol commands (stub)."""
-
-
-@jboss.command("scan")
-@click.option("-t", "--target", required=True, metavar="HOST")
-@click.option("-p", "--port", default=4444, show_default=True, type=int)
-def jboss_scan(target: str, port: int) -> None:
-    """Scan a JBoss JNP endpoint (not yet implemented)."""
-    click.echo("[!] JBoss scanner is not yet implemented.")
+cli.add_command(rmi_cmds.rmi)
+cli.add_command(jboss_cmds.jboss)

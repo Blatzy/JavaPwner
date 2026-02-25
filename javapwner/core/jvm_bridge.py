@@ -40,19 +40,6 @@ _INSPECTOR_SOURCE = _LIB_DIR / "JiniInspector.java"
 _INSPECTOR_CLASS = _LIB_DIR / "JiniInspector.class"
 _SECURITY_POLICY = _LIB_DIR / "security.policy"
 
-# Glob patterns for discovering Jini / River JARs
-_JAR_GLOBS = [
-    "jsk-lib*.jar",
-    "jsk-platform*.jar",
-    "jsk-resources*.jar",
-    "river-lib*.jar",
-    "jini-core*.jar",
-    "jini-ext*.jar",
-    "reggie*.jar",
-    "start*.jar",
-    "*.jar",  # fallback: include all JARs found in lib/
-]
-
 _PATH_SEP = ";" if platform.system() == "Windows" else ":"
 
 
@@ -168,8 +155,12 @@ class JvmBridge:
         java_home: str | None = None,
         timeout: float = 30.0,
     ):
+        self._java_home = java_home
+
+        # Build per-subprocess environment (never mutate os.environ)
+        self._env = os.environ.copy()
         if java_home:
-            os.environ["JAVA_HOME"] = java_home
+            self._env["JAVA_HOME"] = java_home
 
         self._java = _find_executable("java")
         self._javac = _find_executable("javac")
@@ -286,6 +277,7 @@ class JvmBridge:
                 capture_output=True,
                 text=True,
                 timeout=self._timeout,
+                env=self._env,
             )
         except subprocess.TimeoutExpired as exc:
             raise JvmBridgeError(f"javac timed out after {self._timeout}s") from exc
@@ -405,6 +397,7 @@ class JvmBridge:
                 text=True,
                 timeout=self._timeout,
                 cwd=str(_LIB_DIR),
+                env=self._env,
             )
         except subprocess.TimeoutExpired as exc:
             raise JvmBridgeError(

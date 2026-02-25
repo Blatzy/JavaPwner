@@ -762,3 +762,58 @@ def admin_cmd(ctx: click.Context, target: str, port: int,
                     for attr in svc.attributes[:5]:
                         fmt.debug(f"    attr: {attr}")
 
+
+# ---------------------------------------------------------------------------
+# multicast  — active multicast discovery (send request, collect responses)
+# ---------------------------------------------------------------------------
+
+@jini.command("multicast")
+@click.option("--group", "groups", multiple=True, metavar="GROUP",
+              help="Discovery group to announce (repeatable). Default: public group.")
+@click.option("--wait", default=3.0, show_default=True, type=float,
+              metavar="SECS", help="Seconds to collect multicast responses.")
+@click.pass_context
+def multicast_cmd(ctx: click.Context, groups: tuple[str, ...], wait: float) -> None:
+    """Send a Jini Multicast Discovery Request and collect Reggie responses.
+
+    Sends a UDP multicast to the Jini well-known group (224.0.1.85:4160)
+    and starts a temporary TCP callback server to receive unicast responses
+    from any Jini Lookup Services on the local network.
+
+    \b
+    Examples:
+      javapwner jini multicast
+      javapwner jini multicast --group public --wait 5
+    """
+    fmt = _get_fmt(ctx)
+    timeout = _get_timeout(ctx)
+
+    groups_list = list(groups) if groups else None
+
+    fmt.info(f"Sending Multicast Discovery Request (wait={wait}s)…")
+    try:
+        scanner = JiniScanner(timeout=timeout)
+        result = scanner.multicast_discover(groups=groups_list, wait=wait)
+    except JavaPwnerError as exc:
+        fmt.error(str(exc))
+        sys.exit(1)
+
+    if fmt.json_mode:
+        fmt.print_json(result.to_dict())
+        return
+
+    if not result.sent:
+        fmt.error(f"Failed to send multicast: {result.error}")
+        sys.exit(1)
+
+    fmt.success("Multicast request sent.")
+    if not result.responders:
+        fmt.info("No responses received within the wait window.")
+        return
+
+    fmt.success(f"Received {len(result.responders)} response(s):")
+    for resp in result.responders:
+        host = resp.get("host", "?")
+        port = resp.get("port", "?")
+        grps = resp.get("groups", [])
+        fmt.info(f"  {host}:{port}  groups={grps}")

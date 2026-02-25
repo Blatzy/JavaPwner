@@ -67,7 +67,7 @@ class TestEnumeratorNewFieldsPopulated:
         raw = _MAGIC + b"http://codebase.example.com/classes" + b"\x00"
         sr = _make_scan_result(raw)
         enumerator = JiniEnumerator()
-        result = enumerator.enumerate("127.0.0.1", 4160, scan_result=sr)
+        result = enumerator.enumerate("127.0.0.1", 4160, scan_result=sr, probe_codebase=False)
         assert "http://codebase.example.com/classes" in result.codebase_urls
 
     def test_nested_stream_count_one(self):
@@ -105,7 +105,7 @@ class TestEnumeratorNewFieldsPopulated:
         raw = _MAGIC + b"http://x.com/y" + b"\x00"
         sr = _make_scan_result(raw)
         enumerator = JiniEnumerator()
-        result = enumerator.enumerate("127.0.0.1", 4160, scan_result=sr)
+        result = enumerator.enumerate("127.0.0.1", 4160, scan_result=sr, probe_codebase=False)
         d = result.to_dict()
         assert isinstance(d["codebase_urls"], list)
         assert isinstance(d["embedded_endpoints"], list)
@@ -117,7 +117,7 @@ class TestEnumeratorNewFieldsPopulated:
         raw = _MAGIC + url + b"\x00" + _MAGIC + url + b"\x00"
         sr = _make_scan_result(raw)
         enumerator = JiniEnumerator()
-        result = enumerator.enumerate("127.0.0.1", 4160, scan_result=sr)
+        result = enumerator.enumerate("127.0.0.1", 4160, scan_result=sr, probe_codebase=False)
         assert result.codebase_urls.count("http://example.com/cb") == 1
 
     def test_existing_fields_unaffected(self):
