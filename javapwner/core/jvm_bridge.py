@@ -32,8 +32,10 @@ from javapwner.exceptions import JvmBridgeError
 
 logger = logging.getLogger(__name__)
 
-# The Java helper lives alongside the JARs in lib/
-_LIB_DIR = Path(__file__).resolve().parent.parent / "lib"
+# The Java helper lives alongside the JARs in lib/ at the project root.
+# Path: javapwner/core/jvm_bridge.py → parent = javapwner/core/
+#       parent.parent = javapwner/  → parent.parent.parent = project root
+_LIB_DIR = Path(__file__).resolve().parent.parent.parent / "lib"
 _INSPECTOR_SOURCE = _LIB_DIR / "JiniInspector.java"
 _INSPECTOR_CLASS = _LIB_DIR / "JiniInspector.class"
 _SECURITY_POLICY = _LIB_DIR / "security.policy"
