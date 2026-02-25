@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import sys
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Generator
 
 from rich.console import Console
 from rich.panel import Panel
@@ -51,6 +52,30 @@ class OutputFormatter:
     # ------------------------------------------------------------------
     # Structured output
     # ------------------------------------------------------------------
+
+    @property
+    def console(self) -> Console:
+        """Direct access to the Rich Console (for Status, Live, etc.)."""
+        return self._console
+
+    @contextmanager
+    def status(self, msg: str) -> Generator[None, None, None]:
+        """Context manager: display a Rich spinner while work is in progress.
+
+        In JSON or quiet mode the spinner is suppressed.
+        """
+        if self.json_mode or self.quiet:
+            yield
+            return
+        with self._console.status(f"[cyan]{msg}[/cyan]"):
+            yield
+
+    def section(self, title: str) -> None:
+        """Print a section rule to visually separate output phases."""
+        if self.json_mode or self.quiet:
+            return
+        self._console.print()
+        self._console.rule(f"[bold cyan]{title}[/bold cyan]", style="cyan")
 
     def print_banner(self) -> None:
         if self.quiet or self.json_mode:

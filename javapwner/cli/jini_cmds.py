@@ -36,6 +36,49 @@ def _get_ysoserial(ctx: click.Context) -> str | None:
     return ctx.obj.get("ysoserial_path")
 
 
+def _scan_cmd_json(
+    ctx: click.Context,
+    fmt: OutputFormatter,
+    target: str,
+    port: int,
+    timeout: float,
+    no_codebase: bool,
+) -> None:
+    """JSON-mode path for scan_cmd — collects everything then emits one blob."""
+    try:
+        scanner = JiniScanner(timeout=timeout)
+        scan_result = scanner.scan(target, port)
+    except JavaPwnerError as exc:
+        fmt.error(str(exc))
+        sys.exit(1)
+
+    try:
+        enumerator = JiniEnumerator(timeout=timeout)
+        enum_result = enumerator.enumerate(
+            target, port,
+            scan_result=scan_result,
+            probe_codebase=not no_codebase,
+        )
+    except JavaPwnerError as exc:
+        fmt.error(str(exc))
+        sys.exit(1)
+
+    ep_result = None
+    try:
+        probe = JiniProbe(timeout=timeout)
+        ep_result = probe.probe_endpoint(target, port, scan_result=scan_result)
+    except JavaPwnerError:
+        pass
+
+    out: dict = {
+        "scan": scan_result.to_dict(),
+        "enum": enum_result.to_dict(),
+    }
+    if ep_result:
+        out["probe_endpoint"] = ep_result.to_dict()
+    fmt.print_json(out)
+
+
 @click.group()
 def jini() -> None:
     """Apache River / Jini protocol commands."""
@@ -69,54 +112,22 @@ def scan_cmd(ctx: click.Context, target: str, port: int, no_codebase: bool) -> N
     fmt = _get_fmt(ctx)
     timeout = _get_timeout(ctx)
 
-    fmt.info(f"Running full Jini enumeration on {target}:{port} ...")
-
-    # ---- Step 1: Base scan (TCP + JRMP + Unicast) ----
-    try:
-        scanner = JiniScanner(timeout=timeout)
-        scan_result = scanner.scan(target, port)
-    except JavaPwnerError as exc:
-        fmt.error(str(exc))
-        sys.exit(1)
-
-    if not scan_result.is_open:
-        fmt.warning(f"Port {port} appears closed or filtered.")
-        sys.exit(1)
-
-    # ---- Step 2+3: Deep enumeration (heuristic + serial analysis + codebase) ----
-    try:
-        enumerator = JiniEnumerator(timeout=timeout)
-        enum_result = enumerator.enumerate(
-            target, port,
-            scan_result=scan_result,
-            probe_codebase=not no_codebase,
-        )
-    except JavaPwnerError as exc:
-        fmt.error(str(exc))
-        sys.exit(1)
-
-    # ---- Step 4: Endpoint probing ----
-    ep_result = None
-    try:
-        probe = JiniProbe(timeout=timeout)
-        ep_result = probe.probe_endpoint(target, port, scan_result=scan_result)
-    except JavaPwnerError as exc:
-        fmt.error(str(exc))
-
-    # ---- JSON output ----
+    # In JSON mode we must collect everything first and emit one atomic blob.
     if fmt.json_mode:
-        out: dict = {
-            "scan": scan_result.to_dict(),
-            "enum": enum_result.to_dict(),
-        }
-        if ep_result:
-            out["probe_endpoint"] = ep_result.to_dict()
-        fmt.print_json(out)
+        _scan_cmd_json(ctx, fmt, target, port, timeout, no_codebase)
         return
 
-    # ---- Human-readable output ----
+    # ── Phase 1: TCP + JRMP + Unicast Discovery ──────────────────────────────
+    fmt.section("Phase 1 — Network Probe")
+    try:
+        scanner = JiniScanner(timeout=timeout)
+        with fmt.status(f"Probing {target}:{port} (JRMP + Unicast Discovery)…"):
+            scan_result = scanner.scan(target, port)
+    except JavaPwnerError as exc:
+        fmt.error(str(exc))
+        sys.exit(1)
 
-    # -- Scan summary --
+    # Print scan results immediately
     if scan_result.has_unicast_response:
         fmt.success(
             f"Jini Unicast Discovery v{scan_result.unicast_version} confirmed (Reggie)"
@@ -131,18 +142,33 @@ def scan_cmd(ctx: click.Context, target: str, port: int, no_codebase: bool) -> N
             f"JRMP endpoint   : {scan_result.jrmp_host}:{scan_result.jrmp_port} "
             f"(version={scan_result.jrmp_version})"
         )
-
     if scan_result.groups:
         fmt.info(f"Groups          : {', '.join(scan_result.groups)}")
-
     if scan_result.udp_response:
         fmt.info("UDP multicast   : response received")
 
-    # -- Services --
+    if not scan_result.is_open:
+        fmt.warning(f"Port {port} appears closed or filtered.")
+        sys.exit(1)
+
+    # ── Phase 2: Heuristic + deep serial analysis (no HTTP, fast) ────────────
+    fmt.section("Phase 2 — Serialized Proxy Analysis")
+    try:
+        enumerator = JiniEnumerator(timeout=timeout)
+        with fmt.status("Parsing serialised proxy stream…"):
+            enum_result = enumerator.enumerate(
+                target, port,
+                scan_result=scan_result,
+                probe_codebase=False,   # HTTP probing done per-URL in Phase 4
+            )
+    except JavaPwnerError as exc:
+        fmt.error(str(exc))
+        sys.exit(1)
+
+    # Print serial analysis results immediately
     if enum_result.potential_services:
         fmt.print_services_table(enum_result.potential_services)
 
-    # -- URLs --
     if enum_result.urls:
         fmt.info("URLs (TC_STRING):")
         for url in enum_result.urls:
@@ -153,7 +179,6 @@ def scan_cmd(ctx: click.Context, target: str, port: int, no_codebase: bool) -> N
         for url in enum_result.codebase_urls:
             fmt.success(f"  {url}")
 
-    # -- Deep serial analysis --
     if enum_result.class_descriptors:
         fmt.print_class_descriptors(enum_result.class_descriptors)
 
@@ -171,18 +196,32 @@ def scan_cmd(ctx: click.Context, target: str, port: int, no_codebase: bool) -> N
 
     fmt.info(f"Nested streams  : {enum_result.nested_stream_count}")
 
-    # -- System info --
     if enum_result.system_info:
         si = enum_result.system_info
         if si.get("hostnames") or si.get("file_paths") or si.get("java_properties"):
             fmt.info("System information extracted:")
             fmt.print_system_info(si)
 
-    # -- Embedded endpoints --
     if enum_result.embedded_endpoints:
         fmt.info(f"Embedded endpoints ({len(enum_result.embedded_endpoints)}):")
         for ep in enum_result.embedded_endpoints:
             fmt.info(f"  {ep['host']}:{ep['port']}")
+
+    # Verbose: raw strings
+    if fmt.verbose and enum_result.raw_strings:
+        fmt.info("All extracted strings:")
+        for s in enum_result.raw_strings:
+            fmt.debug(f"  {s!r}")
+
+    # ── Phase 3: JRMP endpoint confirmation ──────────────────────────────────
+    fmt.section("Phase 3 — Endpoint Confirmation")
+    ep_result = None
+    try:
+        probe = JiniProbe(timeout=timeout)
+        with fmt.status("Confirming JRMP endpoints…"):
+            ep_result = probe.probe_endpoint(target, port, scan_result=scan_result)
+    except JavaPwnerError as exc:
+        fmt.error(str(exc))
 
     if ep_result and ep_result.confirmed:
         fmt.success(
@@ -191,25 +230,35 @@ def scan_cmd(ctx: click.Context, target: str, port: int, no_codebase: bool) -> N
         )
     elif ep_result and ep_result.candidates:
         fmt.info(f"Endpoint candidates (unconfirmed): {len(ep_result.candidates)}")
+    else:
+        fmt.info("No additional JRMP endpoints discovered.")
 
-    # -- HTTP codebase exploitation --
-    if enum_result.codebase_exploits:
-        has_any_vuln = any(e.traversal_vulnerable for e in enum_result.codebase_exploits)
-        header = "HTTP Codebase Exploitation"
-        if has_any_vuln:
-            header += " — [bold red]VULNERABILITIES FOUND[/bold red]"
-        fmt.info(header + ":")
-        for exploit in enum_result.codebase_exploits:
-            fmt.print_codebase_exploit(exploit.to_dict())
-    elif not no_codebase:
+    # ── Phase 4: HTTP codebase exploitation (per-URL, progressive) ───────────
+    if no_codebase:
+        if scan_result.raw_proxy_bytes:
+            fmt.print_hex_dump(scan_result.raw_proxy_bytes, label="Raw proxy bytes")
+        return
+
+    fmt.section("Phase 4 — HTTP Codebase Exploitation")
+    http_urls = enumerator.collect_codebase_http_urls(enum_result)
+
+    if not http_urls:
         fmt.info("No HTTP codebase URLs found to probe.")
+    else:
+        for base_url in http_urls:
+            fmt.info(f"Probing codebase server: {base_url}")
 
-    # -- Verbose: raw strings + hex dump --
-    if fmt.verbose and enum_result.raw_strings:
-        fmt.info("All extracted strings:")
-        for s in enum_result.raw_strings:
-            fmt.debug(f"  {s!r}")
+            def _progress_cb(msg: str, _url: str = base_url) -> None:  # noqa: ANN001
+                fmt.debug(f"  [{_url}] {msg}")
 
+            explorer = CodebaseExplorer(timeout=timeout, progress_cb=_progress_cb)
+            with fmt.status(f"Probing {base_url}…"):
+                exploit = explorer.explore(base_url)
+
+            # Print this URL's results immediately
+            fmt.print_codebase_exploit(exploit.to_dict())
+
+    # Hex dump at the very end
     if scan_result.raw_proxy_bytes:
         fmt.print_hex_dump(scan_result.raw_proxy_bytes, label="Raw proxy bytes")
 

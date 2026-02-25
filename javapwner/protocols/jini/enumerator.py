@@ -22,6 +22,7 @@ reserved for future implementation.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -110,6 +111,7 @@ class JiniEnumerator:
         scan_result: ScanResult | None = None,
         *,
         probe_codebase: bool = True,
+        progress_cb: "Callable[[str], None] | None" = None,
     ) -> EnumResult:
         """Run all enumeration tiers against *host*:*port*.
 
@@ -120,8 +122,11 @@ class JiniEnumerator:
         scan_result:
             Optional pre-existing :class:`ScanResult` (avoids double scanning).
         probe_codebase:
-            If ``True`` (default), also probe HTTP codebase servers for
-            directory listings, path traversal, and file reading.
+            If ``True`` (default), also probe HTTP codebase servers.
+            The probe is done per-URL; ``progress_cb`` receives live messages.
+        progress_cb:
+            Optional callable receiving a plain-text status message for each
+            long operation (traversal probes, file reads).
         """
         if scan_result is None:
             scan_result = self._scanner.scan(host, port)
@@ -182,30 +187,41 @@ class JiniEnumerator:
 
         # === Tier 1++: HTTP codebase exploitation ===
         if probe_codebase:
-            # Collect HTTP/HTTPS codebase URLs to probe
-            http_urls: list[str] = []
-            seen_http: set[str] = set()
-
-            for url in cb_urls:
-                base = self._url_base(url)
-                if base and base not in seen_http:
-                    seen_http.add(base)
-                    http_urls.append(base)
-
-            for annot in result.class_annotations:
-                url = annot.get("annotation_url", "") or annot.get("url", "")
-                base = self._url_base(url)
-                if base and base not in seen_http:
-                    seen_http.add(base)
-                    http_urls.append(base)
-
+            http_urls = self.collect_codebase_http_urls(result)
             if http_urls:
-                explorer = CodebaseExplorer(timeout=self.timeout)
+                explorer = CodebaseExplorer(
+                    timeout=self.timeout,
+                    progress_cb=progress_cb,
+                )
                 for base_url in http_urls:
                     exploit_result = explorer.explore(base_url)
                     result.codebase_exploits.append(exploit_result)
 
         return result
+
+    def collect_codebase_http_urls(self, enum_result: EnumResult) -> list[str]:
+        """Return deduplicated HTTP/HTTPS base URLs to probe for codebase exploitation.
+
+        Collects from ``codebase_urls`` (raw bytes) and ``class_annotations``.
+        Call this after :meth:`enumerate` to get URLs for per-URL probing.
+        """
+        seen_http: set[str] = set()
+        http_urls: list[str] = []
+
+        for url in enum_result.codebase_urls:
+            base = self._url_base(url)
+            if base and base not in seen_http:
+                seen_http.add(base)
+                http_urls.append(base)
+
+        for annot in enum_result.class_annotations:
+            url = annot.get("annotation_url", "") or annot.get("url", "")
+            base = self._url_base(url)
+            if base and base not in seen_http:
+                seen_http.add(base)
+                http_urls.append(base)
+
+        return http_urls
 
     # ------------------------------------------------------------------
     # Internal helpers
