@@ -39,6 +39,24 @@ _HOST_RE = re.compile(
 )
 _MAX_HOST_LEN = 253
 
+# Regex for file system paths
+_UNIX_PATH_RE = re.compile(
+    r"(/(?:etc|usr|opt|var|tmp|home|root|proc|sys|boot|mnt|srv|lib|bin|sbin|run|dev)"
+    r"(?:/[a-zA-Z0-9._\-]+)*)"
+)
+_WIN_PATH_RE = re.compile(
+    r"([A-Z]:\\(?:[a-zA-Z0-9._\-]+\\)*[a-zA-Z0-9._\-]+)"
+)
+_CLASSPATH_RE = re.compile(
+    r"(/[a-zA-Z0-9._\-/]+\.(?:jar|class|war|ear|properties|xml|conf|cfg|policy))"
+)
+
+# Regex for Java system property names
+_JAVA_PROP_RE = re.compile(
+    r"\b((?:java|javax|sun|os|user|file|path|line|awt|jdk|com\.sun)"
+    r"\.[a-zA-Z0-9_.]+)\b"
+)
+
 
 def is_java_serialized(data: bytes) -> bool:
     """Return True if *data* starts with Java serialization magic bytes."""
@@ -235,3 +253,245 @@ def extract_endpoint_hints(data: bytes) -> list[dict]:
         _scan(sub)
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Deep serial stream analysis — class descriptors, annotations, system info
+# ---------------------------------------------------------------------------
+
+
+def parse_class_descriptors(data: bytes) -> list[dict[str, Any]]:
+    """Parse TC_CLASSDESC and TC_PROXYCLASSDESC entries from a serial stream.
+
+    Returns a list of dicts:
+      - For TC_CLASSDESC: ``{"type": "class", "name": ..., "uid": ..., "offset": ...}``
+      - For TC_PROXYCLASSDESC: ``{"type": "proxy", "interfaces": [...], "offset": ...}``
+    """
+    results: list[dict[str, Any]] = []
+
+    def _scan(buf: bytes, base_offset: int = 0) -> None:
+        i = 0
+        length = len(buf)
+
+        while i < length:
+            b = buf[i]
+
+            # TC_CLASSDESC: 0x72 + uint16 name_len + name + int64 SUID + ...
+            if b == TC_CLASSDESC and i + 3 <= length:
+                try:
+                    name_len = struct.unpack_from(">H", buf, i + 1)[0]
+                    name_end = i + 3 + name_len
+                    if name_end + 8 <= length and name_len < 512:
+                        name = buf[i + 3:name_end].decode("utf-8", errors="replace")
+                        uid = struct.unpack_from(">q", buf, name_end)[0]
+                        # Sanity: class names should look like identifiers
+                        if name and ("." in name or name[0].isupper() or name.startswith("[")):
+                            results.append({
+                                "type": "class",
+                                "name": name,
+                                "uid": uid,
+                                "offset": base_offset + i,
+                            })
+                except (struct.error, IndexError):
+                    pass
+                i += 1
+                continue
+
+            # TC_PROXYCLASSDESC: 0x7D + int32 iface_count + N × writeUTF
+            if b == TC_PROXYCLASSDESC and i + 5 <= length:
+                try:
+                    iface_count = struct.unpack_from(">I", buf, i + 1)[0]
+                    if 0 < iface_count <= 64:
+                        offset = i + 5
+                        interfaces: list[str] = []
+                        valid = True
+                        for _ in range(iface_count):
+                            if offset + 2 > length:
+                                valid = False
+                                break
+                            iface_len = struct.unpack_from(">H", buf, offset)[0]
+                            offset += 2
+                            if offset + iface_len > length or iface_len > 512:
+                                valid = False
+                                break
+                            iname = buf[offset:offset + iface_len].decode(
+                                "utf-8", errors="replace"
+                            )
+                            interfaces.append(iname)
+                            offset += iface_len
+                        if valid and interfaces:
+                            results.append({
+                                "type": "proxy",
+                                "interfaces": interfaces,
+                                "offset": base_offset + i,
+                            })
+                except (struct.error, IndexError):
+                    pass
+                i += 1
+                continue
+
+            i += 1
+
+    _scan(data, 0)
+    for nested_off, sub in find_nested_streams(data):
+        _scan(sub, nested_off)
+
+    # Deduplicate by (type, name/interfaces)
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for entry in results:
+        if entry["type"] == "class":
+            key = f"class:{entry['name']}"
+        else:
+            key = f"proxy:{','.join(entry['interfaces'])}"
+        if key not in seen:
+            seen.add(key)
+            deduped.append(entry)
+
+    return deduped
+
+
+def extract_class_annotations(data: bytes) -> list[dict[str, Any]]:
+    """Extract codebase URL annotations from class descriptors.
+
+    In RMI serialization, each class descriptor is followed by a
+    ``classAnnotation`` section that typically contains:
+      TC_STRING <codebase_url> TC_ENDBLOCKDATA
+
+    Returns a list of ``{"class_name": ..., "annotation_url": ...}`` dicts.
+    """
+    results: list[dict[str, Any]] = []
+    i = 0
+    length = len(data)
+
+    while i < length:
+        b = data[i]
+
+        if b == TC_CLASSDESC and i + 3 <= length:
+            try:
+                name_len = struct.unpack_from(">H", data, i + 1)[0]
+                name_end = i + 3 + name_len
+                if name_end + 8 <= length and name_len < 512:
+                    class_name = data[i + 3:name_end].decode("utf-8", errors="replace")
+                    # Skip past SUID (8 bytes) + flags (1 byte) + field_count (2 bytes)
+                    # Then scan for annotation URLs in the bytes that follow
+                    scan_start = name_end + 8 + 1  # SUID + flags
+                    if scan_start + 2 <= length:
+                        field_count = struct.unpack_from(">H", data, scan_start)[0]
+                        # Skip field descriptors (approximate — each is at least 3 bytes)
+                        annot_start = scan_start + 2 + (field_count * 3)
+                        # Search for TC_STRING + URL pattern in annotation area
+                        scan_end = min(annot_start + 512, length)
+                        for url in _RAW_URL_RE.findall(data[annot_start:scan_end]):
+                            try:
+                                url_str = url.decode("ascii")
+                                results.append({
+                                    "class_name": class_name,
+                                    "annotation_url": url_str,
+                                })
+                            except Exception:
+                                pass
+            except (struct.error, IndexError):
+                pass
+            i += 1
+            continue
+
+        i += 1
+
+    return results
+
+
+def extract_file_paths(data: bytes) -> list[str]:
+    """Extract filesystem paths embedded in a Java serialization stream.
+
+    Scans both TC_STRING values and raw bytes for Unix and Windows paths,
+    as well as classpath-style entries (``*.jar``, ``*.class``, etc.).
+    """
+    paths: set[str] = set()
+
+    # From TC_STRING values
+    strings = extract_strings_from_stream(data)
+    for s in strings:
+        for m in _UNIX_PATH_RE.findall(s):
+            paths.add(m)
+        for m in _WIN_PATH_RE.findall(s):
+            paths.add(m)
+        for m in _CLASSPATH_RE.findall(s):
+            paths.add(m)
+
+    # From raw bytes (catches paths not wrapped as TC_STRING)
+    try:
+        text = data.decode("ascii", errors="ignore")
+        for m in _UNIX_PATH_RE.findall(text):
+            paths.add(m)
+        for m in _WIN_PATH_RE.findall(text):
+            paths.add(m)
+        for m in _CLASSPATH_RE.findall(text):
+            paths.add(m)
+    except Exception:
+        pass
+
+    return sorted(paths)
+
+
+def extract_system_info(data: bytes) -> dict[str, Any]:
+    """Extract system-level information from a serialization stream.
+
+    Returns a dict with keys:
+      ``hostnames``        — hostnames extracted from endpoints and strings
+      ``java_properties``  — Java system property names found
+      ``file_paths``       — filesystem paths (delegated to extract_file_paths)
+      ``class_names``      — Java class names from class descriptors
+      ``proxy_interfaces`` — interface names from proxy class descriptors
+      ``codebase_annotations`` — codebase URLs per class
+      ``serial_version_uids`` — {class_name: SUID} for fingerprinting
+    """
+    strings = extract_strings_from_stream(data)
+    descriptors = parse_class_descriptors(data)
+    annotations = extract_class_annotations(data)
+    file_paths = extract_file_paths(data)
+    endpoints = extract_endpoint_hints(data)
+
+    # Hostnames from endpoints
+    hostnames: list[str] = []
+    seen_hosts: set[str] = set()
+    for ep in endpoints:
+        h = ep["host"]
+        if h not in seen_hosts:
+            seen_hosts.add(h)
+            hostnames.append(h)
+
+    # Java property-like strings
+    java_props: set[str] = set()
+    for s in strings:
+        for m in _JAVA_PROP_RE.findall(s):
+            java_props.add(m)
+
+    # Class names and UIDs
+    class_names: list[str] = []
+    proxy_interfaces: list[str] = []
+    serial_uids: dict[str, int] = {}
+    for desc in descriptors:
+        if desc["type"] == "class":
+            class_names.append(desc["name"])
+            serial_uids[desc["name"]] = desc["uid"]
+        elif desc["type"] == "proxy":
+            proxy_interfaces.extend(desc["interfaces"])
+
+    # Codebase annotation URLs
+    codebase_annots: list[dict[str, str]] = []
+    for annot in annotations:
+        codebase_annots.append({
+            "class": annot["class_name"],
+            "url": annot["annotation_url"],
+        })
+
+    return {
+        "hostnames": hostnames,
+        "java_properties": sorted(java_props),
+        "file_paths": file_paths,
+        "class_names": class_names,
+        "proxy_interfaces": proxy_interfaces,
+        "codebase_annotations": codebase_annots,
+        "serial_version_uids": serial_uids,
+    }

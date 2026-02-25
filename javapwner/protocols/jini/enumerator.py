@@ -1,11 +1,22 @@
-"""JiniEnumerator — Tier 1 heuristic enumeration of Jini services.
+"""JiniEnumerator — deep enumeration of Jini services.
 
-This module operates purely in Python by extracting class names and strings
-from the raw serialised proxy blob returned by the Unicast Discovery protocol.
-It does NOT require a running JVM or jini-bridge.jar.
+This module combines multiple enumeration sources:
 
-Tier 2 enumeration (full ServiceRegistrar.lookup()) will be added later with
-lib/jini-bridge.jar.
+**Tier 1 — Heuristic** (no JVM required):
+  Extract class names, strings, URLs, and endpoints from the raw serialised
+  proxy blob returned by the Unicast Discovery protocol.
+
+**Tier 1+ — Deep Serial Analysis** (no JVM required):
+  Parse ``TC_CLASSDESC`` / ``TC_PROXYCLASSDESC`` entries to build a class
+  hierarchy, extract codebase annotation URLs, serial version UIDs, filesystem
+  paths, and system information from the stream.
+
+**Tier 1++ — HTTP Codebase Exploitation** (no JVM required):
+  Probe the HTTP codebase server for directory listings, test path traversal,
+  and read arbitrary files from the target filesystem.
+
+Tier 2 enumeration (full ``ServiceRegistrar.lookup()`` via JVM bridge) is
+reserved for future implementation.
 """
 
 from __future__ import annotations
@@ -15,12 +26,17 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from javapwner.core.serialization import (
+    extract_class_annotations,
     extract_endpoint_hints,
+    extract_file_paths,
     extract_raw_urls,
     extract_strings_from_stream,
+    extract_system_info,
     find_nested_streams,
     get_stream_metadata,
+    parse_class_descriptors,
 )
+from javapwner.protocols.jini.codebase import CodebaseExploreResult, CodebaseExplorer
 from javapwner.protocols.jini.scanner import JiniScanner, ScanResult
 
 # Patterns that suggest interesting Jini / Java RMI class names
@@ -31,6 +47,7 @@ _URL_RE = re.compile(r"((?:jrmi?|http|https|rmi)://[^\s\x00-\x1f\"]+)")
 
 @dataclass
 class EnumResult:
+    # --- Tier 1 (original) ---
     groups: list[str] = field(default_factory=list)
     extracted_classes: list[str] = field(default_factory=list)
     potential_services: list[dict[str, str]] = field(default_factory=list)
@@ -40,6 +57,17 @@ class EnumResult:
     codebase_urls: list[str] = field(default_factory=list)
     embedded_endpoints: list[dict] = field(default_factory=list)
     nested_stream_count: int = 0
+
+    # --- Tier 1+ (deep serial analysis) ---
+    class_descriptors: list[dict[str, Any]] = field(default_factory=list)
+    class_annotations: list[dict[str, Any]] = field(default_factory=list)
+    proxy_interfaces: list[str] = field(default_factory=list)
+    serial_version_uids: dict[str, int] = field(default_factory=dict)
+    file_paths: list[str] = field(default_factory=list)
+    system_info: dict[str, Any] = field(default_factory=dict)
+
+    # --- Tier 1++ (HTTP codebase exploitation) ---
+    codebase_exploits: list[CodebaseExploreResult] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -52,17 +80,49 @@ class EnumResult:
             "codebase_urls": self.codebase_urls,
             "embedded_endpoints": self.embedded_endpoints,
             "nested_stream_count": self.nested_stream_count,
+            # Deep analysis
+            "class_descriptors": self.class_descriptors,
+            "class_annotations": self.class_annotations,
+            "proxy_interfaces": self.proxy_interfaces,
+            "serial_version_uids": self.serial_version_uids,
+            "file_paths": self.file_paths,
+            "system_info": self.system_info,
+            # Codebase exploitation
+            "codebase_exploits": [e.to_dict() for e in self.codebase_exploits],
         }
 
 
 class JiniEnumerator:
-    """Heuristic (Tier 1) enumeration of a Jini / Reggie target."""
+    """Deep enumeration of a Jini / Reggie target.
+
+    Combines heuristic string extraction, deep serial stream parsing,
+    and HTTP codebase server exploitation into a single ``enumerate()`` call.
+    """
 
     def __init__(self, timeout: float = 5.0):
         self.timeout = timeout
         self._scanner = JiniScanner(timeout=timeout)
 
-    def enumerate(self, host: str, port: int, scan_result: ScanResult | None = None) -> EnumResult:
+    def enumerate(
+        self,
+        host: str,
+        port: int,
+        scan_result: ScanResult | None = None,
+        *,
+        probe_codebase: bool = True,
+    ) -> EnumResult:
+        """Run all enumeration tiers against *host*:*port*.
+
+        Parameters
+        ----------
+        host, port:
+            Target Jini lookup service.
+        scan_result:
+            Optional pre-existing :class:`ScanResult` (avoids double scanning).
+        probe_codebase:
+            If ``True`` (default), also probe HTTP codebase servers for
+            directory listings, path traversal, and file reading.
+        """
         if scan_result is None:
             scan_result = self._scanner.scan(host, port)
 
@@ -72,6 +132,7 @@ class JiniEnumerator:
         if not raw:
             return result
 
+        # === Tier 1: heuristic string extraction ===
         strings = extract_strings_from_stream(raw)
         result.raw_strings = strings
 
@@ -83,10 +144,11 @@ class JiniEnumerator:
 
         result.potential_services = self._identify_services(classes, strings)
 
-        # --- Enhanced enumeration (additive) ---
+        # Nested streams
         nested = find_nested_streams(raw)
         result.nested_stream_count = len(nested)
 
+        # Codebase URLs (from raw bytes)
         seen_cb: set[str] = set()
         cb_urls: list[str] = []
         for url in extract_raw_urls(raw):
@@ -100,13 +162,67 @@ class JiniEnumerator:
                     cb_urls.append(url)
         result.codebase_urls = cb_urls
 
+        # Embedded endpoints
         result.embedded_endpoints = extract_endpoint_hints(raw)
+
+        # === Tier 1+: deep serial analysis ===
+        result.class_descriptors = parse_class_descriptors(raw)
+        result.class_annotations = extract_class_annotations(raw)
+        result.file_paths = extract_file_paths(raw)
+        result.system_info = extract_system_info(raw)
+
+        # Extract proxy interfaces and serial UIDs from descriptors
+        for desc in result.class_descriptors:
+            if desc["type"] == "proxy":
+                result.proxy_interfaces.extend(desc["interfaces"])
+            elif desc["type"] == "class":
+                result.serial_version_uids[desc["name"]] = desc["uid"]
+
+        result.tier = 2  # Tier 1+ achieved
+
+        # === Tier 1++: HTTP codebase exploitation ===
+        if probe_codebase:
+            # Collect HTTP/HTTPS codebase URLs to probe
+            http_urls: list[str] = []
+            seen_http: set[str] = set()
+
+            for url in cb_urls:
+                base = self._url_base(url)
+                if base and base not in seen_http:
+                    seen_http.add(base)
+                    http_urls.append(base)
+
+            for annot in result.class_annotations:
+                url = annot.get("annotation_url", "") or annot.get("url", "")
+                base = self._url_base(url)
+                if base and base not in seen_http:
+                    seen_http.add(base)
+                    http_urls.append(base)
+
+            if http_urls:
+                explorer = CodebaseExplorer(timeout=self.timeout)
+                for base_url in http_urls:
+                    exploit_result = explorer.explore(base_url)
+                    result.codebase_exploits.append(exploit_result)
 
         return result
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _url_base(url: str) -> str | None:
+        """Extract the base URL (scheme + host + port + /) from a full URL."""
+        lower = url.lower()
+        if not (lower.startswith("http://") or lower.startswith("https://")):
+            return None
+        # Find the first '/' after the scheme
+        after_scheme = url.find("//") + 2
+        slash = url.find("/", after_scheme)
+        if slash == -1:
+            return url + "/"
+        return url[:slash + 1]
 
     def _extract_classes(self, strings: list[str]) -> list[str]:
         classes = []

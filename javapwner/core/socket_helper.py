@@ -200,5 +200,11 @@ def write_java_long(value: int) -> bytes:
 
 
 def write_java_utf(value: str) -> bytes:
+    """Encode a string as Java writeUTF (2-byte length prefix + UTF-8 payload)."""
+    raw = value.encode("utf-8")
+    return struct.pack(">H", len(raw)) + raw
+
+
+def write_java_utf(value: str) -> bytes:
     encoded = value.encode("utf-8")
     return struct.pack(">H", len(encoded)) + encoded

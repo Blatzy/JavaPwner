@@ -136,3 +136,124 @@ class OutputFormatter:
 
     def print_json(self, data: Any) -> None:
         print(json.dumps(data, indent=2, default=str))
+
+    # ------------------------------------------------------------------
+    # Deep enumeration display
+    # ------------------------------------------------------------------
+
+    def print_class_descriptors(self, descriptors: list[dict[str, Any]]) -> None:
+        """Print a table of class descriptors (TC_CLASSDESC / TC_PROXYCLASSDESC)."""
+        if self.json_mode:
+            self.print_json(descriptors)
+            return
+        if not descriptors:
+            return
+
+        table = Table(title="Class Descriptors", border_style="cyan")
+        table.add_column("Type", style="dim", width=7)
+        table.add_column("Name / Interfaces", style="cyan", no_wrap=False)
+        table.add_column("Serial UID", style="dim", width=22)
+
+        for desc in descriptors:
+            if desc["type"] == "class":
+                table.add_row("class", desc["name"], str(desc.get("uid", "")))
+            elif desc["type"] == "proxy":
+                ifaces = ", ".join(desc.get("interfaces", []))
+                table.add_row("proxy", ifaces, "")
+
+        self._console.print(table)
+
+    def print_system_info(self, info: dict[str, Any]) -> None:
+        """Print extracted system information."""
+        if self.json_mode:
+            self.print_json(info)
+            return
+
+        if info.get("hostnames"):
+            self._console.print(
+                f"  Hostnames       : [cyan]{', '.join(info['hostnames'])}[/cyan]"
+            )
+        if info.get("java_properties"):
+            self._console.print("  Java properties :")
+            for prop in info["java_properties"]:
+                self._console.print(f"    [dim]{prop}[/dim]")
+        if info.get("file_paths"):
+            self._console.print("  File paths      :")
+            for path in info["file_paths"]:
+                self._console.print(f"    [yellow]{path}[/yellow]")
+        if info.get("codebase_annotations"):
+            self._console.print("  Codebase annotations:")
+            for annot in info["codebase_annotations"]:
+                self._console.print(
+                    f"    [cyan]{annot['class']}[/cyan] → [green]{annot['url']}[/green]"
+                )
+
+    def print_codebase_exploit(self, result: dict[str, Any]) -> None:
+        """Print results of HTTP codebase server exploitation."""
+        if self.json_mode:
+            self.print_json(result)
+            return
+
+        url = result.get("base_url", "?")
+        reachable = result.get("server_reachable", False)
+        server = result.get("server_header", "")
+
+        if not reachable:
+            self._console.print(f"  [red]UNREACHABLE[/red] {url}")
+            return
+
+        self._console.print(f"  [green]REACHABLE[/green] {url}")
+        if server:
+            self._console.print(f"    Server: [dim]{server}[/dim]")
+
+        entries = result.get("directory_listing", [])
+        if entries:
+            self._console.print(f"    Directory listing ({len(entries)} entries):")
+            for entry in entries[:20]:
+                self._console.print(f"      [cyan]{entry}[/cyan]")
+            if len(entries) > 20:
+                self._console.print(f"      [dim]... and {len(entries) - 20} more[/dim]")
+
+        probed = result.get("probed_paths", [])
+        if probed:
+            self._console.print("    Accessible codebase paths:")
+            for p in probed:
+                self._console.print(
+                    f"      [green]{p['path']}[/green] "
+                    f"({p['content_length']} bytes)"
+                )
+
+        if result.get("traversal_vulnerable"):
+            technique = result.get("working_traversal", "?")
+            depth = result.get("working_depth", "?")
+            self._console.print(
+                f"    [bold red]!! PATH TRAVERSAL VULNERABLE !![/bold red]"
+                f"  (technique: {technique} × {depth})"
+            )
+
+        files = result.get("readable_files", [])
+        if files:
+            self._console.print(
+                f"    [bold red]Readable files ({len(files)}):[/bold red]"
+            )
+            for f in files:
+                self._console.print(
+                    f"      [red]{f['path']}[/red] "
+                    f"({f['content_length']} bytes, {f['technique']})"
+                )
+
+    def print_file_content(self, path: str, content: str, technique: str = "") -> None:
+        """Print the content of a file read from the target."""
+        if self.json_mode:
+            self.print_json({"path": path, "content": content, "technique": technique})
+            return
+
+        tech_info = f" [dim](via {technique})[/dim]" if technique else ""
+        self._console.print(
+            Panel(
+                Text(content),
+                title=f"{path}{tech_info}",
+                border_style="red",
+                expand=False,
+            )
+        )
