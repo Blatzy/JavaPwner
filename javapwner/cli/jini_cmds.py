@@ -17,6 +17,7 @@ from javapwner.core.output import OutputFormatter
 from javapwner.exceptions import JavaPwnerError, PayloadError
 from javapwner.protocols.jini.enumerator import JiniEnumerator
 from javapwner.protocols.jini.exploiter import JiniExploiter
+from javapwner.protocols.jini.probe import JiniProbe
 from javapwner.protocols.jini.scanner import JiniScanner
 
 DEFAULT_PORT = 4160
@@ -191,6 +192,186 @@ def exploit_cmd(ctx: click.Context, target: str, port: int, gadget: str,
 
     if fmt.verbose:
         fmt.print_hex_dump(result.response_bytes, label="Server response")
+
+
+# ---------------------------------------------------------------------------
+# gadgets
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# probe-codebase
+# ---------------------------------------------------------------------------
+
+@jini.command("probe-codebase")
+@click.option("-t", "--target", required=True, metavar="HOST",
+              help="Target hostname or IP address.")
+@click.option("-p", "--port", default=DEFAULT_PORT, show_default=True, type=int,
+              metavar="PORT")
+@click.pass_context
+def probe_codebase_cmd(ctx: click.Context, target: str, port: int) -> None:
+    """Extract and probe codebase URLs from a Jini proxy blob."""
+    fmt = _get_fmt(ctx)
+    timeout = _get_timeout(ctx)
+
+    fmt.info(f"Probing codebase URLs on {target}:{port} ...")
+
+    try:
+        probe = JiniProbe(timeout=timeout)
+        result = probe.probe_codebase(target, port)
+    except JavaPwnerError as exc:
+        fmt.error(str(exc))
+        sys.exit(1)
+
+    if fmt.json_mode:
+        fmt.print_json(result.to_dict())
+        return
+
+    if not result.urls:
+        fmt.warning("No codebase URLs found in proxy blob.")
+        return
+
+    for url in result.urls:
+        reachable = result.reachable.get(url)
+        if reachable:
+            fmt.success(f"  [REACHABLE]   {url}")
+            fmt.warning(f"  !! RMI codebase attack vector — {url} is accessible")
+        else:
+            fmt.info(f"  [UNREACHABLE] {url}")
+
+
+# ---------------------------------------------------------------------------
+# probe-endpoint
+# ---------------------------------------------------------------------------
+
+@jini.command("probe-endpoint")
+@click.option("-t", "--target", required=True, metavar="HOST",
+              help="Target hostname or IP address.")
+@click.option("-p", "--port", default=DEFAULT_PORT, show_default=True, type=int,
+              metavar="PORT")
+@click.pass_context
+def probe_endpoint_cmd(ctx: click.Context, target: str, port: int) -> None:
+    """Extract embedded JRMP endpoints from proxy blob and confirm via handshake."""
+    fmt = _get_fmt(ctx)
+    timeout = _get_timeout(ctx)
+
+    fmt.info(f"Probing embedded endpoints on {target}:{port} ...")
+
+    try:
+        probe = JiniProbe(timeout=timeout)
+        result = probe.probe_endpoint(target, port)
+    except JavaPwnerError as exc:
+        fmt.error(str(exc))
+        sys.exit(1)
+
+    if fmt.json_mode:
+        fmt.print_json(result.to_dict())
+        return
+
+    if not result.candidates:
+        fmt.warning("No embedded endpoint candidates found.")
+        return
+
+    fmt.info(f"Candidates found ({len(result.candidates)}):")
+    for c in result.candidates:
+        tag = " [CONFIRMED — JRMP ACK]" if c == result.confirmed else ""
+        fmt.info(f"  {c['host']}:{c['port']}{tag}")
+
+    if result.confirmed is None:
+        fmt.warning("No candidate responded to JRMP handshake.")
+    else:
+        fmt.success(
+            f"Confirmed JRMP endpoint: {result.confirmed['host']}:{result.confirmed['port']}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# info
+# ---------------------------------------------------------------------------
+
+@jini.command("info")
+@click.option("-t", "--target", required=True, metavar="HOST",
+              help="Target hostname or IP address.")
+@click.option("-p", "--port", default=DEFAULT_PORT, show_default=True, type=int,
+              metavar="PORT")
+@click.pass_context
+def info_cmd(ctx: click.Context, target: str, port: int) -> None:
+    """Full recon: scan + enum + probe-codebase + probe-endpoint (single connection)."""
+    fmt = _get_fmt(ctx)
+    timeout = _get_timeout(ctx)
+
+    fmt.info(f"Running full recon on {target}:{port} ...")
+
+    try:
+        scanner = JiniScanner(timeout=timeout)
+        scan_result = scanner.scan(target, port)
+    except JavaPwnerError as exc:
+        fmt.error(str(exc))
+        sys.exit(1)
+
+    if not scan_result.is_open:
+        fmt.warning(f"Port {port} appears closed or filtered.")
+        sys.exit(1)
+
+    try:
+        enumerator = JiniEnumerator(timeout=timeout)
+        enum_result = enumerator.enumerate(target, port, scan_result=scan_result)
+
+        probe = JiniProbe(timeout=timeout)
+        cb_result = probe.probe_codebase(target, port, scan_result=scan_result)
+        ep_result = probe.probe_endpoint(target, port, scan_result=scan_result)
+    except JavaPwnerError as exc:
+        fmt.error(str(exc))
+        sys.exit(1)
+
+    if fmt.json_mode:
+        fmt.print_json({
+            "scan": scan_result.to_dict(),
+            "enum": enum_result.to_dict(),
+            "probe_codebase": cb_result.to_dict(),
+            "probe_endpoint": ep_result.to_dict(),
+        })
+        return
+
+    # --- Scan summary ---
+    if scan_result.has_unicast_response:
+        fmt.success(f"Jini Unicast Discovery v{scan_result.unicast_version} confirmed (Reggie)")
+    elif scan_result.is_jrmp:
+        fmt.success("JRMP detected")
+    else:
+        fmt.warning("No Jini/JRMP response detected")
+
+    if scan_result.groups:
+        fmt.info(f"Groups        : {', '.join(scan_result.groups)}")
+
+    # --- Enum summary ---
+    if enum_result.potential_services:
+        fmt.print_services_table(enum_result.potential_services)
+
+    if enum_result.urls:
+        fmt.info("TC_STRING URLs:")
+        for url in enum_result.urls:
+            fmt.info(f"  {url}")
+
+    fmt.info(f"Nested streams: {enum_result.nested_stream_count}")
+
+    # --- Codebase probe ---
+    if cb_result.urls:
+        fmt.info("Codebase URLs:")
+        for url in cb_result.urls:
+            reachable = cb_result.reachable.get(url)
+            tag = "[REACHABLE]" if reachable else "[UNREACHABLE]"
+            fmt.info(f"  {tag} {url}")
+            if reachable:
+                fmt.warning(f"  !! RMI codebase attack vector")
+
+    # --- Endpoint probe ---
+    if ep_result.confirmed:
+        fmt.success(
+            f"Confirmed JRMP endpoint: "
+            f"{ep_result.confirmed['host']}:{ep_result.confirmed['port']}"
+        )
+    elif ep_result.candidates:
+        fmt.info(f"Endpoint candidates (unconfirmed): {len(ep_result.candidates)}")
 
 
 # ---------------------------------------------------------------------------

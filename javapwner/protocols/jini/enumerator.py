@@ -14,7 +14,13 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from javapwner.core.serialization import extract_strings_from_stream, get_stream_metadata
+from javapwner.core.serialization import (
+    extract_endpoint_hints,
+    extract_raw_urls,
+    extract_strings_from_stream,
+    find_nested_streams,
+    get_stream_metadata,
+)
 from javapwner.protocols.jini.scanner import JiniScanner, ScanResult
 
 # Patterns that suggest interesting Jini / Java RMI class names
@@ -31,6 +37,9 @@ class EnumResult:
     raw_strings: list[str] = field(default_factory=list)
     urls: list[str] = field(default_factory=list)
     tier: int = 1
+    codebase_urls: list[str] = field(default_factory=list)
+    embedded_endpoints: list[dict] = field(default_factory=list)
+    nested_stream_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -40,6 +49,9 @@ class EnumResult:
             "potential_services": self.potential_services,
             "raw_strings": self.raw_strings,
             "urls": self.urls,
+            "codebase_urls": self.codebase_urls,
+            "embedded_endpoints": self.embedded_endpoints,
+            "nested_stream_count": self.nested_stream_count,
         }
 
 
@@ -70,6 +82,25 @@ class JiniEnumerator:
         result.urls = urls
 
         result.potential_services = self._identify_services(classes, strings)
+
+        # --- Enhanced enumeration (additive) ---
+        nested = find_nested_streams(raw)
+        result.nested_stream_count = len(nested)
+
+        seen_cb: set[str] = set()
+        cb_urls: list[str] = []
+        for url in extract_raw_urls(raw):
+            if url not in seen_cb:
+                seen_cb.add(url)
+                cb_urls.append(url)
+        for _, sub in nested:
+            for url in extract_raw_urls(sub):
+                if url not in seen_cb:
+                    seen_cb.add(url)
+                    cb_urls.append(url)
+        result.codebase_urls = cb_urls
+
+        result.embedded_endpoints = extract_endpoint_hints(raw)
 
         return result
 
