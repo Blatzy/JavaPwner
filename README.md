@@ -47,51 +47,21 @@ Le Tier 2 permet de se connecter réellement au Registrar Jini pour :
 - Détecter les capacités admin : `JoinAdmin`, `DestroyAdmin`, `StorageLocationAdmin`
 - Lister tous les services enregistrés dans le Lookup Service
 
-### 1. Installer le JDK
+Les JARs Apache River (`jsk-lib`, `jsk-platform`) sont déjà inclus dans `lib/`.
+Seul prérequis : un JDK.
 
 ```bash
 sudo apt update && sudo apt install -y default-jdk
-```
-
-Vérifier :
-
-```bash
 java -version && javac -version
 ```
 
-### 2. Télécharger Apache River
-
-```bash
-cd /tmp
-wget https://archive.apache.org/dist/river/river-3.0.0/apache-river-3.0.0-src.tar.gz
-tar xzf apache-river-3.0.0-src.tar.gz
-```
-
-### 3. Copier les JARs nécessaires dans `lib/`
-
-Seuls deux JARs sont requis (`jsk-lib.jar` et `jsk-platform.jar`) :
-
-```bash
-# Depuis le répertoire du projet JavaPwner :
-cp /tmp/apache-river-3.0.0/lib/jsk-lib.jar lib/
-cp /tmp/apache-river-3.0.0/lib/jsk-platform.jar lib/
-```
-
-> **Alternative** : si les JARs ne sont pas dans le bundle source, télécharger directement depuis Maven Central :
->
-> ```bash
-> cd lib/
-> wget https://repo1.maven.org/maven2/org/apache/river/jsk-lib/3.0.0/jsk-lib-3.0.0.jar -O jsk-lib.jar
-> wget https://repo1.maven.org/maven2/org/apache/river/jsk-platform/3.0.0/jsk-platform-3.0.0.jar -O jsk-platform.jar
-> ```
-
-### 4. Vérifier le setup
+Vérifier le setup :
 
 ```bash
 javapwner jini admin -t 192.168.1.10
 ```
 
-Si les prérequis sont manquants, l'outil affiche un message d'erreur explicite indiquant ce qui manque.
+Si un prérequis manque, l'outil affiche un message d'erreur explicite.
 
 ### Configuration avancée
 

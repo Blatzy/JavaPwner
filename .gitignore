@@ -6,3 +6,11 @@ dist/
 build/
 .pytest_cache/
 lib/ysoserial.jar
+
+# Java compiled classes (generated on demand by jvm_bridge)
+lib/*.class
+
+# IDE
+.idea/
+.vscode/
+*.swp
