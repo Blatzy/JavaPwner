@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+                             http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.javapwner</groupId>
+    <artifactId>javapwner-jini-helper</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <name>JavaPwner Jini Helper</name>
+    <description>
+        Fat JAR that bundles JiniInspector with Apache River dependencies.
+        Built with: mvn package -f lib/pom.xml
+        Output: lib/target/javapwner-jini-helper-1.0-SNAPSHOT-jar-with-dependencies.jar
+    </description>
+
+    <properties>
+        <maven.compiler.source>11</maven.compiler.source>
+        <maven.compiler.target>11</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <river.version>3.0.0</river.version>
+    </properties>
+
+    <dependencies>
+        <!-- Apache River (Jini) -->
+        <dependency>
+            <groupId>org.apache.river</groupId>
+            <artifactId>river-start</artifactId>
+            <version>${river.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.river</groupId>
+            <artifactId>river-lib</artifactId>
+            <version>${river.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>net.jini</groupId>
+            <artifactId>jsk-platform</artifactId>
+            <version>2.2.3</version>
+        </dependency>
+        <dependency>
+            <groupId>net.jini</groupId>
+            <artifactId>jsk-lib</artifactId>
+            <version>2.2.3</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <!-- Include JiniInspector.java from lib/ -->
+        <sourceDirectory>${project.basedir}</sourceDirectory>
+        <includes>
+            <include>JiniInspector.java</include>
+        </includes>
+
+        <plugins>
+            <!-- Compile with Java 11 -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.11.0</version>
+                <configuration>
+                    <source>11</source>
+                    <target>11</target>
+                    <includes>
+                        <include>JiniInspector.java</include>
+                    </includes>
+                </configuration>
+            </plugin>
+
+            <!-- Build fat JAR with all dependencies -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-assembly-plugin</artifactId>
+                <version>3.6.0</version>
+                <configuration>
+                    <archive>
+                        <manifest>
+                            <mainClass>JiniInspector</mainClass>
+                        </manifest>
+                    </archive>
+                    <descriptorRefs>
+                        <descriptorRef>jar-with-dependencies</descriptorRef>
+                    </descriptorRefs>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>make-assembly</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>single</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

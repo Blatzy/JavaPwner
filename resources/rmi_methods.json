@@ -1,0 +1,43 @@
+{
+  "java.rmi.registry.Registry": {
+    "lookup(java.lang.String)": -7538657168040752697,
+    "list()": 2571371466621089378,
+    "bind(java.lang.String, java.rmi.Remote)": 7583982177005850366,
+    "rebind(java.lang.String, java.rmi.Remote)": -8381844669958460146,
+    "unbind(java.lang.String)": 7305022919901907578
+  },
+  "java.rmi.activation.ActivationSystem": {
+    "registerGroup(java.rmi.activation.ActivationGroupDesc)": -4648205576063949536,
+    "registerObject(java.rmi.activation.ActivationDesc)": -4605765158498660498,
+    "unregisterObject(java.rmi.activation.ActivationID)": -3117037979822394530
+  },
+  "java.rmi.dgc.DGC": {
+    "dirty(java.rmi.server.ObjID[], long, java.rmi.dgc.Lease)": -669196253586618813,
+    "clean(java.rmi.server.ObjID[], long, java.rmi.dgc.VMID, boolean)": -5765232569032362256
+  },
+  "javax.management.remote.rmi.RMIServer": {
+    "newClient(Object)": 763546802127794350,
+    "getVersion()": -8081107751519807180
+  },
+  "javax.management.remote.rmi.RMIConnection": {
+    "invoke(javax.management.ObjectName, java.lang.String, java.rmi.MarshalledObject, java.lang.String[], javax.security.auth.Subject)": -3127966498653205882,
+    "getAttribute(javax.management.ObjectName, java.lang.String, javax.security.auth.Subject)": -5788847463193887498,
+    "getDefaultDomain(javax.security.auth.Subject)": 2470273300205860498
+  },
+  "sun.management.jmxremote.SingleEntryRegistry": {
+    "lookup(java.lang.String)": -7538657168040752697, 
+    "list()": 2571371466621089378
+  },
+  "org.springframework.remoting.rmi.RmiInvocationHandler": {
+    "getTargetInterfaceName()": 7191437750144127714,
+    "invoke(org.springframework.remoting.support.RemoteInvocation)": -5765232569032362256
+  },
+  "de.qtc.rmg.server.ServerInterface": {
+    "execute(java.lang.String)": 4715677962029541849
+  },
+  "known_dangerous_methods": {
+    "java.lang.Runtime.exec(java.lang.String)": 0,
+    "java.lang.ProcessBuilder.command(java.util.List)": 0,
+    "javax.naming.Context.lookup(java.lang.String)": -7538657168040752697
+  }
+}

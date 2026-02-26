@@ -142,12 +142,12 @@ class TestRmiScannerJrmpConfirmed:
     @patch("javapwner.protocols.rmi.scanner.TCPSession")
     def test_jrmp_confirmed(self, mock_cls):
         ack = _make_ack("server.local", 1099)
-        # _jrmp_handshake, _registry_list (2 connections), _dgc_probe
-        # We need separate sessions for each connection since _jrmp_handshake
-        # only checks ack, then _registry_list opens a new connection
+        # _jrmp_handshake, _registry_list, _registry_lookups (1 per name), _dgc_probe
         sessions = [
             MockSession([ack]),                  # _jrmp_handshake
             MockSession([ack, _make_list_return(["jmxrmi", "MyService"])]),  # _registry_list
+            MockSession([ack, b"\x51\x01"]),     # _registry_lookups: lookup("jmxrmi")
+            MockSession([ack, b"\x51\x01"]),     # _registry_lookups: lookup("MyService")
             MockSession([ack, b"\x51\x01"]),     # _dgc_probe (no exception = unfiltered)
         ]
         mock_cls.side_effect = sessions
@@ -165,6 +165,8 @@ class TestRmiScannerRegistryNames:
         sessions = [
             MockSession([ack]),
             MockSession([ack, list_return]),
+            MockSession([ack, b"\x51\x01"]),     # lookup("jmxrmi")
+            MockSession([ack, b"\x51\x01"]),     # lookup("svc1")
             MockSession([ack, b"\x51\x01"]),
         ]
         mock_cls.side_effect = sessions

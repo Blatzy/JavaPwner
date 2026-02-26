@@ -39,6 +39,9 @@ _LIB_DIR = Path(__file__).resolve().parent.parent.parent / "lib"
 _INSPECTOR_SOURCE = _LIB_DIR / "JiniInspector.java"
 _INSPECTOR_CLASS = _LIB_DIR / "JiniInspector.class"
 _SECURITY_POLICY = _LIB_DIR / "security.policy"
+_POM_XML = _LIB_DIR / "pom.xml"
+_FAT_JAR_DIR = _LIB_DIR / "target"
+_FAT_JAR_GLOB = "javapwner-jini-helper-*-jar-with-dependencies.jar"
 
 _PATH_SEP = ";" if platform.system() == "Windows" else ":"
 
@@ -58,6 +61,15 @@ def _find_executable(name: str) -> str | None:
 
     # 2. PATH
     return shutil.which(name)
+
+
+def _find_fat_jar() -> Path | None:
+    """Locate the pre-built fat JAR in lib/target/."""
+    if _FAT_JAR_DIR.is_dir():
+        jars = list(_FAT_JAR_DIR.glob(_FAT_JAR_GLOB))
+        if jars:
+            return jars[0]
+    return None
 
 
 def _discover_jars(extra_dirs: list[Path] | None = None) -> list[Path]:
@@ -164,12 +176,14 @@ class JvmBridge:
 
         self._java = _find_executable("java")
         self._javac = _find_executable("javac")
+        self._mvn = _find_executable("mvn")
         self._classpath_parts = classpath
         self._timeout = timeout
 
         # Resolved lazily
         self._classpath: str | None = None
         self._compiled = False
+        self._fat_jar: Path | None = _find_fat_jar()
 
     # ------------------------------------------------------------------
     # Status queries
@@ -182,6 +196,14 @@ class JvmBridge:
     @property
     def javac_available(self) -> bool:
         return self._javac is not None
+
+    @property
+    def mvn_available(self) -> bool:
+        return self._mvn is not None
+
+    @property
+    def fat_jar_available(self) -> bool:
+        return self._fat_jar is not None and self._fat_jar.is_file()
 
     @property
     def classpath(self) -> str:
@@ -294,6 +316,65 @@ class JvmBridge:
         return _INSPECTOR_CLASS
 
     # ------------------------------------------------------------------
+    # Maven fat JAR build
+    # ------------------------------------------------------------------
+
+    def build_fat_jar(self, force: bool = False) -> Path:
+        """Build the fat JAR using Maven (``mvn package -f lib/pom.xml``).
+
+        Returns the path to the built fat JAR.
+        Raises :class:`JvmBridgeError` on failure.
+        """
+        if not force and self.fat_jar_available:
+            return self._fat_jar  # type: ignore[return-value]
+
+        if not self._mvn:
+            raise JvmBridgeError(
+                "Maven (mvn) not found — cannot build fat JAR. "
+                "Install Maven or build manually: mvn package -f lib/pom.xml"
+            )
+
+        if not _POM_XML.is_file():
+            raise JvmBridgeError(f"pom.xml not found at {_POM_XML}")
+
+        cmd = [
+            self._mvn,
+            "package",
+            "-f", str(_POM_XML),
+            "-q",                  # quiet mode
+            "-DskipTests",
+        ]
+
+        logger.info("Building fat JAR: %s", " ".join(cmd))
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,  # Maven builds can be slow
+                env=self._env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise JvmBridgeError("Maven build timed out after 120s") from exc
+        except FileNotFoundError as exc:
+            raise JvmBridgeError(f"mvn not found: {exc}") from exc
+
+        if proc.returncode != 0:
+            stderr = proc.stderr.strip()[:500]
+            raise JvmBridgeError(
+                f"Maven build failed (rc={proc.returncode}):\n{stderr}"
+            )
+
+        # Locate the built fat JAR
+        fat_jar = _find_fat_jar()
+        if fat_jar is None:
+            raise JvmBridgeError("Maven build succeeded but fat JAR not found in target/")
+
+        self._fat_jar = fat_jar
+        return fat_jar
+
+    # ------------------------------------------------------------------
     # Execution
     # ------------------------------------------------------------------
 
@@ -325,6 +406,15 @@ class JvmBridge:
 
         if not self._java:
             raise JvmBridgeError("java not found — cannot run JiniInspector")
+
+        # If a fat JAR exists, prefer it (single classpath entry, all deps bundled)
+        if self.fat_jar_available:
+            logger.info("Using fat JAR: %s", self._fat_jar)
+            fat_cp = str(self._fat_jar)
+            result = self._execute_inspector(fat_cp, host, port, timeout_ms)
+            if result.get("success"):
+                return result
+            # Fall through to the two-pass strategy if fat JAR fails
 
         # Pass 1: API-only classpath — let RMI download the right proxy
         logger.info("Pass 1: API-only classpath (RMI codebase loading)")
