@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -184,6 +185,7 @@ class JvmBridge:
         self._classpath: str | None = None
         self._compiled = False
         self._fat_jar: Path | None = _find_fat_jar()
+        self._java_major_version_cache: int | None = None
 
     # ------------------------------------------------------------------
     # Status queries
@@ -226,6 +228,37 @@ class JvmBridge:
             if not Path(p).name.startswith("reggie")
         ]
         return _PATH_SEP.join(filtered)
+
+    @property
+    def java_major_version(self) -> int:
+        """Return the JVM major version (8, 11, 17, 21…), or 0 if unknown.
+
+        The result is cached after the first call.
+        """
+        if self._java_major_version_cache is not None:
+            return self._java_major_version_cache
+        version = 0
+        if self._java is not None:
+            try:
+                proc = subprocess.run(
+                    [self._java, "-version"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    env=self._env,
+                )
+                # java -version writes to stderr: 'java version "17.0.4"' or
+                # 'openjdk version "11.0.16"'
+                output = proc.stderr or proc.stdout
+                # "1.8.0_xyz" → 8;  "11.0.x" → 11;  "17.0.x" → 17
+                m = re.search(r'"(\d+)\.(\d+)', output)
+                if m:
+                    major = int(m.group(1))
+                    version = int(m.group(2)) if major == 1 else major
+            except Exception:
+                pass
+        self._java_major_version_cache = version
+        return version
 
     def has_jini_jars(self) -> bool:
         """Return True if at least one Jini/River JAR was found."""
@@ -436,9 +469,11 @@ class JvmBridge:
             # Non-classloading error (timeout, connection refused, etc.)
             return result
 
-        # Pass 2: full classpath with local proxy JARs
+        # Pass 2: full classpath with local proxy JARs.
+        # JiniInspector will attempt SUID-patching via reflection when it
+        # catches InvalidClassException from getRegistrar().
         logger.info(
-            "Pass 1 failed (%s) — retrying with local proxy JARs",
+            "Pass 1 failed (%s) — retrying with local proxy JARs (SUID-patch enabled)",
             error[:120],
         )
         result_full = self._execute_inspector(
@@ -448,7 +483,29 @@ class JvmBridge:
         if result_full.get("success"):
             return result_full
 
-        # Both passes failed — return the more specific error
+        # Both passes failed.
+        # If Pass 2 error is an InvalidClassException SUID mismatch and the
+        # reflection patch couldn't run (e.g. --add-opens not effective),
+        # annotate the error with an actionable message.
+        error2 = result_full.get("error", "")
+        if "InvalidClassException" in error2 and "serialVersionUID" in error2:
+            import re as _re
+            m = _re.search(
+                r"stream classdesc serialVersionUID = (\d+).*?local class serialVersionUID = (\d+)",
+                error2,
+                _re.DOTALL,
+            )
+            if m:
+                stream_suid, local_suid = m.group(1), m.group(2)
+                result_full["error"] = (
+                    f"{error2}\n"
+                    f"[javapwner] SUID mismatch: target has {stream_suid}, "
+                    f"local reggie.jar has {local_suid}. "
+                    f"Place a reggie.jar with SUID={stream_suid} in lib/ "
+                    f"or set JINI_CLASSPATH to override. "
+                    f"(SUID {stream_suid} is typical for Sun Jini 2.x / early River.)"
+                )
+
         return result_full
 
     # ------------------------------------------------------------------
@@ -475,6 +532,12 @@ class JvmBridge:
         # 'allow' lets JiniInspector call System.setSecurityManager()
         # on Java 17-23; ignored on < 17, harmless on 24+.
         cmd.append("-Djava.security.manager=allow")
+
+        # On JDK 9+ strong encapsulation blocks reflective access to
+        # java.io.ObjectStreamClass.suid (needed for SUID-patching retry).
+        # On JDK 8 this flag is unknown and must NOT be passed.
+        if self.java_major_version >= 9:
+            cmd.append("--add-opens=java.base/java.io=ALL-UNNAMED")
 
         cmd.extend(["JiniInspector", host, str(port), str(timeout_ms)])
 

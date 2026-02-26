@@ -100,6 +100,108 @@ public class JiniInspector {
     }
 
     // ──────────────────────────────────────────────────────────────────
+    // SUID-patching helpers
+    // ──────────────────────────────────────────────────────────────────
+
+    /**
+     * Call {@code locator.getRegistrar(timeout)}, transparently handling
+     * {@code InvalidClassException} caused by {@code serialVersionUID} mismatches
+     * between the local reggie JAR (Apache River 3.x, SUID=2) and old targets
+     * (Sun Jini 2.x, computed SUID).
+     *
+     * <p>Strategy:
+     * <ol>
+     *   <li>First attempt — normal deserialization.</li>
+     *   <li>On {@code InvalidClassException}: parse the expected SUID from the
+     *       exception message, patch the {@code ObjectStreamClass.suid} field of
+     *       the affected local class via reflection, then retry once.</li>
+     * </ol>
+     *
+     * <p>The reflection patch requires {@code --add-opens java.base/java.io=ALL-UNNAMED}
+     * on JDK 17+.  When reflective access is denied the exception is re-thrown and
+     * the caller reports it normally; no silent data loss occurs.
+     */
+    private static ServiceRegistrar getRegistrarWithSuidFix(
+            LookupLocator locator, int timeout) throws Exception {
+        try {
+            return locator.getRegistrar(timeout);
+        } catch (java.io.InvalidClassException ice) {
+            String msg = ice.getMessage() != null ? ice.getMessage() : "";
+            // Example message:
+            // "com.sun.jini.reggie.RegistrarProxy; local class incompatible:
+            //  stream classdesc serialVersionUID = 2425188657680236255,
+            //  local class serialVersionUID = 2"
+            String className = extractClassNameFromIce(msg);
+            long streamSuid  = extractSuidFromMessage(msg, "stream classdesc serialVersionUID = ");
+            if (className != null && streamSuid != 0) {
+                boolean patched = patchObjectStreamClassSuid(className, streamSuid);
+                if (patched) {
+                    // Retry with the patched SUID
+                    return locator.getRegistrar(timeout);
+                }
+            }
+            throw ice; // re-throw: caller will output the error
+        }
+    }
+
+    /** Extract the class name from an InvalidClassException message. */
+    private static String extractClassNameFromIce(String msg) {
+        int semi = msg.indexOf(';');
+        if (semi > 0) {
+            String candidate = msg.substring(0, semi).trim();
+            if (candidate.contains(".")) return candidate;
+        }
+        return null;
+    }
+
+    /**
+     * Parse a decimal long following {@code prefix} inside {@code msg}.
+     * Returns 0 if not found or unparseable.
+     */
+    private static long extractSuidFromMessage(String msg, String prefix) {
+        int idx = msg.indexOf(prefix);
+        if (idx < 0) return 0L;
+        int start = idx + prefix.length();
+        int end = start;
+        while (end < msg.length()
+               && (Character.isDigit(msg.charAt(end)) || msg.charAt(end) == '-')) {
+            end++;
+        }
+        try {
+            return Long.parseLong(msg.substring(start, end));
+        } catch (NumberFormatException e) {
+            return 0L;
+        }
+    }
+
+    /**
+     * Use reflection to set {@code ObjectStreamClass.suid} for {@code className}
+     * to {@code targetSuid}.
+     *
+     * <p>Works on JDK 8–16 unconditionally.  On JDK 17+ requires the JVM to be
+     * launched with {@code --add-opens java.base/java.io=ALL-UNNAMED}.
+     *
+     * @return {@code true} if the patch was applied; {@code false} if access
+     *         was denied (Java 17+ without the required {@code --add-opens}).
+     */
+    private static boolean patchObjectStreamClassSuid(String className, long targetSuid) {
+        try {
+            Class<?> clazz = Class.forName(className);
+            java.io.ObjectStreamClass osc = java.io.ObjectStreamClass.lookup(clazz);
+            if (osc == null) return false;
+            java.lang.reflect.Field suidField =
+                    java.io.ObjectStreamClass.class.getDeclaredField("suid");
+            suidField.setAccessible(true);   // InaccessibleObjectException on JDK 17+ w/o --add-opens
+            // suid is declared as 'volatile Long' (nullable) in modern OpenJDK
+            suidField.set(osc, Long.valueOf(targetSuid));
+            return true;
+        } catch (Exception e) {
+            // Reflective access denied (JDK 17+ strong encapsulation) or class not found
+            return false;
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
     // Main inspection logic
     // ──────────────────────────────────────────────────────────────────
 
@@ -107,7 +209,7 @@ public class JiniInspector {
         String jiniUrl = "jini://" + host + ":" + port;
         LookupLocator locator = new LookupLocator(jiniUrl);
 
-        ServiceRegistrar registrar = locator.getRegistrar(timeout);
+        ServiceRegistrar registrar = getRegistrarWithSuidFix(locator, timeout);
 
         StringBuilder j = new StringBuilder(4096);
         j.append("{\"success\":true");

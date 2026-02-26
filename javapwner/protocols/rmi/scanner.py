@@ -110,6 +110,31 @@ class RmiScanResult:
 # Scanner
 # ---------------------------------------------------------------------------
 
+# Well-known ports that commonly run JRMP/RMI services
+COMMON_RMI_PORTS: tuple[int, ...] = (
+    1099,   # default RMI Registry
+    1098,   # RMI activation system
+    1097,   # RMI activation (callback)
+    8282,   # JMX RMI connector (JBoss, Tomcat)
+    8283,   # JMX RMI connector (alternate JBoss/WF)
+    8686,   # JMX RMI (GlassFish 3.x)
+    9099,   # JMX RMI (WebLogic alternate)
+    9999,   # JMX RMI (JBoss default JMX)
+    9001,   # JMX RMI (various)
+    7001,   # WebLogic RMI
+    7002,   # WebLogic RMI SSL
+    7003,   # WebLogic admin
+    4444,   # JBoss JNP / RMI
+    4445,   # JBoss JNP RMI
+    4446,   # JBoss Remoting
+    1100,   # various custom
+    1089,   # various custom
+    50500,  # JMX RMI (custom deployments)
+    50501,  # JMX RMI (alternate)
+    11099,  # JMX RMI (Spring Boot Actuator)
+)
+
+
 class RmiScanner:
     """Scan a Java RMI endpoint for Registry entries and JEP 290 state.
 
@@ -123,6 +148,40 @@ class RmiScanner:
 
     def __init__(self, timeout: float = 5.0):
         self.timeout = timeout
+
+    def scan_ports(
+        self,
+        host: str,
+        ports: list[int],
+        *,
+        urldns_canary: str | None = None,
+    ) -> list[RmiScanResult]:
+        """Scan multiple *ports* and return results for every JRMP-speaking endpoint.
+
+        For each port that responds to a JRMP handshake, a full scan is run
+        (Registry list, lookup, DGC JEP 290 probe).  Ports that are closed or
+        that do not speak JRMP are silently skipped.
+
+        Parameters
+        ----------
+        host:
+            Target hostname or IP address.
+        ports:
+            List of TCP ports to probe.
+        urldns_canary:
+            Optional URLDNS canary (see :meth:`scan`).
+
+        Returns
+        -------
+        list[RmiScanResult]
+            Results for all JRMP-speaking endpoints, ordered by port number.
+        """
+        found: list[RmiScanResult] = []
+        for port in sorted(set(ports)):
+            result = self.scan(host, port, urldns_canary=urldns_canary)
+            if result.is_jrmp or result.is_open:
+                found.append(result)
+        return found
 
     def scan(
         self,
