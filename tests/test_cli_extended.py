@@ -73,7 +73,7 @@ class TestRmiScanUrldns:
         mock_scan.return_value = mock_result
 
         result = _invoke(
-            "--json", "rmi", "scan", "-t", "10.0.0.1",
+            "--json", "rmi", "scan", "-t", "10.0.0.1", "-p", "1099",
             "--urldns", "http://test.example.com",
         )
 

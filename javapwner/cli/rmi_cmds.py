@@ -3,6 +3,7 @@
 Commands:
   javapwner rmi discover -t HOST [--ports LIST] [--port-range START:END]
   javapwner rmi scan    -t HOST [-p PORT]     ← Registry enumeration + JEP 290 probe
+                                                 (omit -p to auto-scan common ports)
   javapwner rmi exploit -t HOST -p PORT --gadget NAME --cmd CMD
   javapwner rmi gadgets
   javapwner rmi guess   -t HOST -p PORT --name BINDING
@@ -48,13 +49,16 @@ def rmi() -> None:
 @rmi.command("scan")
 @click.option("-t", "--target", required=True, metavar="HOST",
               help="Target hostname or IP address.")
-@click.option("-p", "--port", default=DEFAULT_PORT, show_default=True, type=int,
-              metavar="PORT", help="TCP port of the RMI endpoint.")
+@click.option("-p", "--port", default=None, type=int, metavar="PORT",
+              help="TCP port to scan. Omit to auto-scan common RMI/JMX ports.")
 @click.option("--urldns", "urldns_canary", default=None, metavar="URL",
               help="Send a URLDNS payload via DGC to detect blind deserialization (check DNS logs).")
 @click.pass_context
-def scan_cmd(ctx: click.Context, target: str, port: int, urldns_canary: str | None) -> None:
+def scan_cmd(ctx: click.Context, target: str, port: int | None, urldns_canary: str | None) -> None:
     """Enumerate a Java RMI Registry and probe for JEP 290 filters.
+
+    If -p is omitted, auto-scans common RMI/JMX ports and reports all
+    JRMP-speaking endpoints found (equivalent to 'rmi discover').
 
     \b
     Steps performed:
@@ -69,9 +73,30 @@ def scan_cmd(ctx: click.Context, target: str, port: int, urldns_canary: str | No
     """
     fmt = _get_fmt(ctx)
     timeout = _get_timeout(ctx)
-
     scanner = RmiScanner(timeout=timeout)
 
+    # ---- Multi-port auto-discovery (no -p specified) ----
+    if port is None:
+        ports = list(COMMON_RMI_PORTS)
+        fmt.info(f"No port specified — scanning {len(ports)} common RMI/JMX ports on {target}…")
+
+        with fmt.status(f"Probing {target}…"):
+            results = scanner.scan_ports(target, ports, urldns_canary=urldns_canary)
+
+        if fmt.json_mode:
+            fmt.print_json([r.to_dict() for r in results])
+            return
+
+        if not results:
+            fmt.warning("No JRMP endpoints found on the common ports.")
+            fmt.info(f"  Try: javapwner rmi scan -t {target} -p <custom_port>")
+            sys.exit(1)
+
+        fmt.success(f"Found {len(results)} JRMP endpoint(s):")
+        _display_scan_results(fmt, target, results)
+        return
+
+    # ---- Single-port scan ----
     with fmt.status(f"Scanning {target}:{port}…"):
         try:
             result = scanner.scan(target, port, urldns_canary=urldns_canary)
@@ -135,6 +160,54 @@ def scan_cmd(ctx: click.Context, target: str, port: int, urldns_canary: str | No
         fmt.section("URLDNS Canary")
         fmt.success(f"URLDNS payload sent — canary: {result.urldns_canary}")
         fmt.info("  Check your DNS server logs for resolution.")
+
+
+def _display_scan_results(fmt: OutputFormatter, target: str, results: list) -> None:
+    """Render multiple RmiScanResult objects (auto-discovery output)."""
+    all_stub_ports: set[int] = set()
+    for r in results:
+        for ep in r.stub_endpoints.values():
+            sp = ep.get("port")
+            if sp:
+                all_stub_ports.add(int(sp))
+
+    scanned_ports = {r.port for r in results}
+    unscanned_stub_ports = all_stub_ports - scanned_ports
+
+    for r in results:
+        fmt.section(f"{target}:{r.port}")
+        d = r.to_dict()
+
+        fmt.info(f"  JRMP    : {'yes' if r.is_jrmp else 'no (TCP open)'}")
+        if r.jrmp_host and (r.jrmp_host != target or r.jrmp_port != r.port):
+            fmt.info(f"  Self-reported: {r.jrmp_host}:{r.jrmp_port}")
+
+        fmt.info(f"  Registry: {'yes' if r.is_registry else 'no'}")
+        jep290_str = d.get("dgc_jep290", "unknown")
+        fmt.info(f"  JEP 290 : {jep290_str}")
+
+        if r.bound_names:
+            fmt.info(f"  Bound names ({len(r.bound_names)}):")
+            for name in r.bound_names:
+                cls = r.name_types.get(name, "unknown")
+                ep = r.stub_endpoints.get(name)
+                ep_str = f" → {ep['host']}:{ep['port']}" if ep else ""
+                fmt.info(f"    {name}  [{cls}]{ep_str}")
+
+        if r.jep290_active is False:
+            fmt.warning(
+                f"  DGC deserialization UNFILTERED — run "
+                f"'javapwner rmi exploit -t {target} -p {r.port}' to test RCE."
+            )
+
+    if unscanned_stub_ports:
+        fmt.section("Stub endpoints on unscanned ports")
+        fmt.warning(
+            "The following ports appear in stub references but were not scanned.\n"
+            "  Consider rescanning with:"
+        )
+        extra = ",".join(str(p) for p in sorted(unscanned_stub_ports))
+        fmt.info(f"    javapwner rmi scan -t {target} -p <port>  (or use rmi discover)")
 
 
 # ---------------------------------------------------------------------------
@@ -457,49 +530,4 @@ def discover_cmd(
         sys.exit(1)
 
     fmt.success(f"Found {len(results)} JRMP endpoint(s):")
-
-    # Collect all stub endpoint ports for cross-reference
-    all_stub_ports: set[int] = set()
-    for r in results:
-        for ep in r.stub_endpoints.values():
-            sp = ep.get("port")
-            if sp:
-                all_stub_ports.add(int(sp))
-
-    scanned_ports = set(ports)
-    unscanned_stub_ports = all_stub_ports - scanned_ports
-
-    for r in results:
-        fmt.section(f"{target}:{r.port}")
-        d = r.to_dict()
-
-        fmt.info(f"  JRMP    : {'yes' if r.is_jrmp else 'no (TCP open)'}")
-        if r.jrmp_host and (r.jrmp_host != target or r.jrmp_port != r.port):
-            fmt.info(f"  Self-reported: {r.jrmp_host}:{r.jrmp_port}")
-
-        fmt.info(f"  Registry: {'yes' if r.is_registry else 'no'}")
-        jep290_str = d.get("dgc_jep290", "unknown")
-        fmt.info(f"  JEP 290 : {jep290_str}")
-
-        if r.bound_names:
-            fmt.info(f"  Bound names ({len(r.bound_names)}):")
-            for name in r.bound_names:
-                cls = r.name_types.get(name, "unknown")
-                ep = r.stub_endpoints.get(name)
-                ep_str = f" → {ep['host']}:{ep['port']}" if ep else ""
-                fmt.info(f"    {name}  [{cls}]{ep_str}")
-
-        if r.jep290_active is False:
-            fmt.warning(
-                f"  DGC deserialization UNFILTERED — run "
-                f"'javapwner rmi exploit -t {target} -p {r.port}' to test RCE."
-            )
-
-    if unscanned_stub_ports:
-        fmt.section("Stub endpoints on unscanned ports")
-        fmt.warning(
-            "The following ports appear in stub references but were not in your scan list.\n"
-            "  Consider rescanning with:"
-        )
-        extra = ",".join(str(p) for p in sorted(unscanned_stub_ports))
-        fmt.info(f"    javapwner rmi discover -t {target} --ports {extra}")
+    _display_scan_results(fmt, target, results)
