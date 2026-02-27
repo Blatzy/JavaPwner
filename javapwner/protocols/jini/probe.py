@@ -268,6 +268,7 @@ class JiniProbe:
 
                 result.dgc_reachable = True
 
+                sess.send(jrmp.build_client_endpoint())
                 sess.send(dgc_call)
                 response = sess.recv_all(timeout=_JRMP_TIMEOUT)
                 result.response_bytes = response

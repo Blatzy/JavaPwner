@@ -85,6 +85,19 @@ def build_jrmp_handshake() -> bytes:
     return JRMP_MAGIC + JRMP_VERSION + STREAM_PROTOCOL
 
 
+def build_client_endpoint() -> bytes:
+    """Return the 6-byte client endpoint (step 3 of JRMP StreamProtocol handshake).
+
+    After receiving ProtocolAck the client must send its own endpoint:
+      writeUTF("")   → 2-byte length prefix (0x00 0x00) + 0 bytes of string
+      writeInt(0)    → 4-byte big-endian zero
+
+    Without this step the server's readUTF() consumes CALL bytes as a string
+    length, corrupting all subsequent communication.
+    """
+    return b"\x00\x00" + b"\x00\x00\x00\x00"
+
+
 def parse_jrmp_ack(data: bytes) -> dict[str, Any]:
     """Parse the JRMP server ProtocolAck response.
 

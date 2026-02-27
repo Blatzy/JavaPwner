@@ -204,10 +204,11 @@ class TestJnpExploiter:
     @patch("javapwner.protocols.jboss.jnp.parse_jrmp_ack")
     @patch("javapwner.protocols.jboss.jnp.TCPSession")
     def test_successful_exploit(self, MockSession, mock_ack, mock_detect):
-        """Payload sent, no exception in response → likely_success=True."""
+        """Payload sent, JRMP RETURN_VALUE response → likely_success=True."""
         mock_ack.return_value = None
         mock_detect.return_value = False
-        sess = _make_mock_session(recv_all_data=b"\x00\x01\x02")
+        # MSG_RETURN (0x51) + RETURN_VALUE (0x01) = proper JRMP success response
+        sess = _make_mock_session(recv_all_data=b"\x51\x01\x00")
         _setup_mock_session(MockSession, sess)
 
         result = JnpExploiter(timeout=2.0).exploit(

@@ -100,9 +100,41 @@ class TestExtractStringsFromStream:
 # ---------------------------------------------------------------------------
 
 class TestDetectExceptionInStream:
-    def test_exception_present(self):
-        data = _MAGIC + bytes([TC_EXCEPTION])
+    # --- JRMP pattern (MSG_RETURN 0x51 + RETURN_EXCEPTION 0x02) ---
+
+    def test_jrmp_exception_at_start(self):
+        # Canonical JRMP exception: MSG_RETURN + RETURN_EXCEPTION at byte 0
+        data = b"\x51\x02" + _MAGIC + bytes([TC_EXCEPTION])
         assert detect_exception_in_stream(data)
+
+    def test_jrmp_return_value_not_exception(self):
+        # RETURN_VALUE (0x01) — not an exception
+        data = b"\x51\x01" + _MAGIC + bytes([TC_STRING])
+        assert not detect_exception_in_stream(data)
+
+    # --- Java serial stream pattern (ACED0005 + TC_EXCEPTION 0x7B) ---
+
+    def test_serial_stream_tc_exception_after_magic(self):
+        # JBoss Remoting2 / non-JRMP: ACED0005 immediately followed by TC_EXCEPTION
+        data = _MAGIC + bytes([TC_EXCEPTION]) + b"\x00" * 10
+        assert detect_exception_in_stream(data)
+
+    def test_serial_stream_tc_exception_embedded_in_frame(self):
+        # Non-JRMP frame: leading garbage, then ACED0005 + TC_EXCEPTION
+        data = b"\x00\x00\x12\x34" + _MAGIC + bytes([TC_EXCEPTION])
+        assert detect_exception_in_stream(data)
+
+    def test_serial_stream_no_exception_typecode(self):
+        # ACED0005 present but followed by TC_OBJECT (0x73), not TC_EXCEPTION (0x7B)
+        data = _MAGIC + b"\x73"
+        assert not detect_exception_in_stream(data)
+
+    def test_bare_0x7b_not_exception(self):
+        # 0x7B byte not preceded by ACED0005 → not detected
+        data = b"\x00\x7b\x00"
+        assert not detect_exception_in_stream(data)
+
+    # --- Edge cases ---
 
     def test_exception_absent(self):
         data = _MAGIC + bytes([TC_STRING])

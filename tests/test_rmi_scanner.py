@@ -306,8 +306,8 @@ class TestGadgetProbe:
         result = RmiScanResult(host="10.0.0.1", port=1099)
 
         ack = _make_ack()
-        # TC_EXCEPTION (0x7b) in response → incompatible (missing class / JEP 290)
-        exception_response = b"\xac\xed\x00\x05\x7b"
+        # JRMP RETURN_EXCEPTION response → incompatible (missing class / JEP 290)
+        exception_response = b"\x51\x02\xac\xed\x00\x05\x7b"
 
         mock_wrapper = MagicMock(spec=YsoserialWrapper)
         mock_wrapper.list_gadgets.return_value = ["CommonsCollections1"]

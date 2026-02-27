@@ -22,6 +22,7 @@ from javapwner.core.socket_helper import TCPSession
 from javapwner.exceptions import ConnectionError
 from javapwner.protocols.rmi.protocol import (
     build_jrmp_handshake,
+    build_client_endpoint,
     build_list_call,
     build_lookup_call,
     parse_jrmp_ack,
@@ -326,6 +327,7 @@ class RmiScanner:
                 except ValueError:
                     return
 
+                sess.send(build_client_endpoint())
                 sess.send(build_list_call())
                 raw = sess.recv_all(timeout=_RECV_TIMEOUT)
                 result.raw_return_bytes = raw
@@ -359,6 +361,7 @@ class RmiScanner:
                     except ValueError:
                         continue
 
+                    sess.send(build_client_endpoint())
                     sess.send(build_lookup_call(name))
                     raw = sess.recv_all(timeout=_RECV_TIMEOUT)
                     if not raw:
@@ -394,6 +397,7 @@ class RmiScanner:
                     parse_jrmp_ack(ack)
                 except ValueError:
                     return
+                sess.send(build_client_endpoint())
                 sess.send(dgc_call)
                 sess.recv_all(timeout=_RECV_TIMEOUT)
                 result.urldns_sent = True
@@ -448,6 +452,7 @@ class RmiScanner:
                         parse_jrmp_ack(ack)
                     except ValueError:
                         continue
+                    sess.send(build_client_endpoint())
                     sess.send(dgc_call)
                     response = sess.recv_all(timeout=_RECV_TIMEOUT)
                     if not detect_exception_in_stream(response):
@@ -476,6 +481,7 @@ class RmiScanner:
                     return
 
                 result.dgc_reachable = True
+                sess.send(build_client_endpoint())
                 sess.send(dgc_call)
                 response = sess.recv_all(timeout=_RECV_TIMEOUT)
 
