@@ -24,7 +24,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from javapwner.core.serialization import (
-    JAVA_SERIAL_HEADER,
     TC_BLOCKDATA,
     TC_EXCEPTION,
     TC_OBJECT,

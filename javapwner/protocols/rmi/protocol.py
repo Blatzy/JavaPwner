@@ -3,9 +3,9 @@
 Wire format reference: JDK source ``sun/rmi/transport/`` and
 ``java/rmi/server/ObjID.java`` / ``sun/rmi/server/UnicastRef.java``.
 
-ObjID encoding (20 bytes on the wire):
-  - objNum  : long  (8 bytes, big-endian)
-  - uid.unique : short (2 bytes)
+ObjID encoding (22 bytes on the wire, from ObjID.write() + UID.write()):
+  - objNum     : long  (8 bytes, big-endian)
+  - uid.unique : int   (4 bytes) ← UID.write() uses writeInt(), NOT writeShort()
   - uid.time   : long  (8 bytes)
   - uid.count  : short (2 bytes)
 
@@ -14,12 +14,14 @@ Well-known ObjIDs (all-zero UID):
   - Activator : objNum = 1
   - DGC        : objNum = 2
 
-CALL message format (new-style hash dispatch, JDK 1.2+):
-  0x50               MSG_CALL
-  ObjID (20 bytes)
-  int32  op = -1     (hash dispatch mode)
-  int64  methodHash  (method-specific hash)
-  [ObjectOutputStream stream with method arguments]
+CALL message format (old-style skel dispatch — proven by wire capture against JDK 8):
+  0x50                MSG_CALL
+  AC ED 00 05         ObjectOutputStream header
+  77 22               TC_BLOCKDATA, 34 bytes (ObjID 22 + op 4 + hash 8)
+  ObjID (22 bytes)    inside block data
+  int32  op           operation index (0=bind,1=list,2=lookup… or 1=dirty for DGC)
+  int64  interfaceHash  skel interface hash (NOT method hash)
+  [raw argument object bytes]  TC_STRING / TC_OBJECT without OOS header
 """
 
 from __future__ import annotations
@@ -63,10 +65,18 @@ TC_EXCEPTION = 0x73      # first byte of an exception in the return stream
 # ---------------------------------------------------------------------------
 
 def _make_objid(obj_num: int) -> bytes:
-    """Encode an ObjID with an all-zero UID as 20 wire bytes."""
+    """Encode an ObjID with an all-zero UID as 22 wire bytes.
+
+    Wire format (from ObjID.write() + UID.write() in the JDK):
+      objNum  : long  (8 bytes, big-endian)
+      uid.unique : int   (4 bytes, big-endian) ← NOT short
+      uid.time   : long  (8 bytes, big-endian)
+      uid.count  : short (2 bytes, big-endian)
+    Total: 22 bytes.
+    """
     return (
         struct.pack(">q", obj_num)   # objNum: long (8 bytes)
-        + struct.pack(">h", 0)       # uid.unique: short (2 bytes)
+        + struct.pack(">i", 0)       # uid.unique: int (4 bytes)
         + struct.pack(">q", 0)       # uid.time:   long (8 bytes)
         + struct.pack(">h", 0)       # uid.count:  short (2 bytes)
     )
@@ -151,37 +161,44 @@ UNBIND_METHOD_HASH: int = 7305022919901907578
 # CALL builders
 # ---------------------------------------------------------------------------
 
-def _make_call(objid: bytes, method_hash: int, arg_stream: bytes) -> bytes:
-    """Build a JRMP CALL message (new-style hash dispatch)."""
+def _make_call(objid: bytes, op: int, intf_hash: int, arg_bytes: bytes = b"") -> bytes:
+    """Build a JRMP CALL message (old-style skel dispatch).
+
+    Wire format proven by capturing a real JDK RMI client (Java 8):
+      MSG_CALL (1 byte)
+      AC ED 00 05          ObjectOutputStream header
+      77 22                TC_BLOCKDATA, 34 bytes
+      [ObjID 22 bytes]     inside block data
+      [op 4 bytes]         inside block data
+      [hash 8 bytes]       inside block data
+      [arg_bytes]          raw argument content (TC_STRING/TC_OBJECT, no OOS header)
+    """
+    block_data = objid + struct.pack(">i", op) + struct.pack(">q", intf_hash)
     return (
         bytes([MSG_CALL])
-        + objid
-        + struct.pack(">i", -1)           # op = -1 → hash dispatch
-        + struct.pack(">q", method_hash)  # method hash
-        + arg_stream
+        + JAVA_STREAM_MAGIC + JAVA_STREAM_VERSION   # OOS header
+        + bytes([0x77, len(block_data)])             # TC_BLOCKDATA
+        + block_data
+        + arg_bytes
     )
-
-
-def _empty_arg_stream() -> bytes:
-    """ObjectOutputStream header with no objects (for no-arg methods)."""
-    return JAVA_STREAM_MAGIC + JAVA_STREAM_VERSION + bytes([TC_ENDBLOCKDATA])
 
 
 def build_list_call() -> bytes:
-    """Build a Registry list() CALL (no arguments)."""
-    return _make_call(REGISTRY_OBJID, LIST_METHOD_HASH, _empty_arg_stream())
+    """Build a Registry list() CALL (no arguments).
+
+    op=1 = list (RegistryImpl_Skel: 0=bind,1=list,2=lookup,3=rebind,4=unbind)
+    hash = REGISTRY_INTERFACE_HASH (old-style skel interface hash)
+    """
+    return _make_call(REGISTRY_OBJID, 1, REGISTRY_INTERFACE_HASH)
 
 
 def build_lookup_call(name: str) -> bytes:
-    """Build a Registry lookup(String) CALL."""
-    arg_stream = (
-        JAVA_STREAM_MAGIC
-        + JAVA_STREAM_VERSION
-        + b"\x74"                  # TC_STRING
-        + write_java_utf(name)     # writeUTF(name)
-        + bytes([TC_ENDBLOCKDATA])
-    )
-    return _make_call(REGISTRY_OBJID, LOOKUP_METHOD_HASH, arg_stream)
+    """Build a Registry lookup(String) CALL.
+
+    op=2 = lookup; argument is TC_STRING with the bound name.
+    """
+    arg_bytes = b"\x74" + write_java_utf(name)   # TC_STRING + 2-byte len + UTF-8
+    return _make_call(REGISTRY_OBJID, 2, REGISTRY_INTERFACE_HASH, arg_bytes)
 
 
 def build_unicastref_payload(host: str, port: int, obj_num: int = 0) -> bytes:
@@ -212,7 +229,7 @@ def build_unicastref_payload(host: str, port: int, obj_num: int = 0) -> bytes:
     endpoint_data = (
         host_bytes
         + struct.pack(">i", port)
-        + _make_objid(obj_num)  # ObjID (20 bytes)
+        + _make_objid(obj_num)  # ObjID (22 bytes)
         + b"\x00"               # isResultStream = false
     )
 

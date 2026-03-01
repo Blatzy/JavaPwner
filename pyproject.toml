@@ -10,7 +10,6 @@ requires-python = ">=3.10"
 dependencies = [
     "click>=8.0",
     "rich>=13.0",
-    "javaobj-py3>=0.4.3",
 ]
 
 [project.optional-dependencies]

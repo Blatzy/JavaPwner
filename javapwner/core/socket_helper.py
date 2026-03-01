@@ -150,12 +150,6 @@ class UDPSession:
 # Java I/O helpers (big-endian, matching java.io.DataOutput / DataInput)
 # ---------------------------------------------------------------------------
 
-def read_java_short(data: bytes, offset: int = 0) -> tuple[int, int]:
-    """Return (value, new_offset) for a big-endian signed 16-bit int."""
-    val = struct.unpack_from(">h", data, offset)[0]
-    return val, offset + 2
-
-
 def read_java_ushort(data: bytes, offset: int = 0) -> tuple[int, int]:
     """Return (value, new_offset) for a big-endian unsigned 16-bit int."""
     val = struct.unpack_from(">H", data, offset)[0]
@@ -181,10 +175,6 @@ def read_java_utf(data: bytes, offset: int = 0) -> tuple[str, int]:
     offset += 2
     raw = data[offset: offset + length]
     return raw.decode("utf-8", errors="replace"), offset + length
-
-
-def write_java_short(value: int) -> bytes:
-    return struct.pack(">h", value)
 
 
 def write_java_ushort(value: int) -> bytes:

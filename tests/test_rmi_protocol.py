@@ -19,17 +19,17 @@ from javapwner.protocols.rmi.protocol import (
     JAVA_STREAM_MAGIC,
     JAVA_STREAM_VERSION,
     TC_ENDBLOCKDATA,
-    LIST_METHOD_HASH,
-    LOOKUP_METHOD_HASH,
+    REGISTRY_INTERFACE_HASH,
 )
 
 
 class TestObjIdEncoding:
     def test_registry_objid_length(self):
-        assert len(REGISTRY_OBJID) == 20
+        # 22 bytes: 8 (objNum) + 4 (uid.unique int) + 8 (uid.time) + 2 (uid.count)
+        assert len(REGISTRY_OBJID) == 22
 
     def test_dgc_objid_length(self):
-        assert len(DGC_OBJID) == 20
+        assert len(DGC_OBJID) == 22
 
     def test_registry_objid_num_zero(self):
         # First 8 bytes = long 0
@@ -43,14 +43,14 @@ class TestObjIdEncoding:
         assert struct.unpack_from(">q", ACTIVATOR_OBJID, 0)[0] == 1
 
     def test_uid_portion_zeros(self):
-        # Bytes 8-19 should all be zero for well-known IDs
-        assert REGISTRY_OBJID[8:] == b"\x00" * 12
+        # Bytes 8-21 should all be zero for well-known IDs (uid.unique + time + count)
+        assert REGISTRY_OBJID[8:] == b"\x00" * 14
 
     def test_make_objid_arbitrary(self):
         oid = _make_objid(42)
-        assert len(oid) == 20
+        assert len(oid) == 22
         assert struct.unpack_from(">q", oid, 0)[0] == 42
-        assert oid[8:] == b"\x00" * 12
+        assert oid[8:] == b"\x00" * 14
 
 
 class TestJrmpHandshake:
@@ -102,33 +102,45 @@ class TestBuildListCall:
         call = build_list_call()
         assert call[0] == MSG_CALL
 
+    def test_oos_header_before_objid(self):
+        # Wire format: MSG_CALL + ACED0005 + TC_BLOCKDATA(34) + ObjID + op + hash
+        call = build_list_call()
+        assert call[1:5] == JAVA_STREAM_MAGIC + JAVA_STREAM_VERSION
+
     def test_contains_registry_objid(self):
         call = build_list_call()
         assert REGISTRY_OBJID in call
 
-    def test_contains_list_hash(self):
+    def test_contains_registry_interface_hash(self):
         call = build_list_call()
-        assert struct.pack(">q", LIST_METHOD_HASH) in call
+        assert struct.pack(">q", REGISTRY_INTERFACE_HASH) in call
 
-    def test_op_minus_one(self):
+    def test_op_one_for_list(self):
+        # Layout: 1(MSG_CALL) + 4(ACED0005) + 2(TC_BLOCKDATA hdr) + 22(ObjID) = 29
         call = build_list_call()
-        # op -1 appears after the ObjID (1 byte MSG_CALL + 20 bytes ObjID)
-        op = struct.unpack_from(">i", call, 21)[0]
-        assert op == -1
+        op = struct.unpack_from(">i", call, 29)[0]
+        assert op == 1   # list() = op 1 in RegistryImpl_Skel
 
-    def test_ends_with_stream(self):
+    def test_total_length(self):
+        # 1 + 4 + 2 + 22 + 4 + 8 = 41 bytes, no args
         call = build_list_call()
-        assert JAVA_STREAM_MAGIC in call
+        assert len(call) == 41
 
 
 class TestBuildLookupCall:
-    def test_contains_lookup_hash(self):
+    def test_contains_registry_interface_hash(self):
         call = build_lookup_call("SomeService")
-        assert struct.pack(">q", LOOKUP_METHOD_HASH) in call
+        assert struct.pack(">q", REGISTRY_INTERFACE_HASH) in call
 
     def test_contains_service_name(self):
         call = build_lookup_call("MyService")
         assert b"MyService" in call
+
+    def test_op_two_for_lookup(self):
+        # Layout: 1 + 4 + 2 + 22 = 29, op at offset 29
+        call = build_lookup_call("X")
+        op = struct.unpack_from(">i", call, 29)[0]
+        assert op == 2   # lookup() = op 2 in RegistryImpl_Skel
 
 
 class TestParseRegistryReturn:

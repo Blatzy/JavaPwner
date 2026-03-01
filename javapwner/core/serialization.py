@@ -227,11 +227,31 @@ def detect_exception_in_stream(data: bytes) -> bool:
     if not data:
         return False
 
-    # Pattern 1 — JRMP: MSG_RETURN (0x51) at byte 0 + RETURN_EXCEPTION (0x02) at byte 1.
-    # JRMP responses always start with the message-type byte, so byte 0 = 0x51
-    # is sufficient to rule out any false positive from embedded data.
-    if len(data) >= 2 and data[0] == 0x51 and data[1] == 0x02:
-        return True
+    # Pattern 1 — JRMP: MSG_RETURN (0x51) followed by the standard return frame.
+    # JRMP responses always start with the message-type byte (0x51 = MSG_RETURN).
+    #
+    # Actual wire format:
+    #   51           MSG_RETURN
+    #   AC ED 00 05  OOS magic + version
+    #   77 0F        TC_BLOCKDATA, length=15
+    #   02           RETURN_EXCEPTION (first byte inside the blockdata)
+    #   ...          callId UID (10 bytes) + exception object
+    #
+    # The return-value type byte is at offset 7, not 1.  We check the OOS header
+    # and TC_BLOCKDATA marker to avoid false positives from embedded 0x02 bytes.
+    if data[0] == 0x51:
+        # Standard format: 51 ACED0005 77 LL 02...
+        if (len(data) >= 8
+                and data[1:5] == b"\xac\xed\x00\x05"
+                and data[5] == 0x77        # TC_BLOCKDATA
+                and data[7] == 0x02):      # RETURN_EXCEPTION at blockdata[0]
+            return True
+        # TC_BLOCKDATALONG variant: 51 ACED0005 7A LLLLLLLL 02...
+        if (len(data) >= 11
+                and data[1:5] == b"\xac\xed\x00\x05"
+                and data[5] == 0x7a        # TC_BLOCKDATALONG
+                and data[10] == 0x02):     # RETURN_EXCEPTION at blockdata[0]
+            return True
 
     # Pattern 2 — Java serial stream with TC_EXCEPTION directly after the header.
     # Format: ACED 0005 7B ...

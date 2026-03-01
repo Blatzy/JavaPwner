@@ -39,7 +39,6 @@ from javapwner.core.serialization import (
     extract_system_info,
     find_nested_streams,
     fingerprint_java_version,
-    get_stream_metadata,
     parse_class_descriptors,
 )
 from javapwner.protocols.jini.codebase import CodebaseExploreResult, CodebaseExplorer

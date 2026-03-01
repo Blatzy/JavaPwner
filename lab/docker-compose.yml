@@ -1,0 +1,84 @@
+version: '3.8'
+
+# ============================================================
+#  JavaPwner Vulnerable Lab Environment
+# ============================================================
+#
+# Three realistic Java middleware targets, each running
+# pre-patch versions with known deserialization vulnerabilities.
+#
+# Port layout (host):
+#   1099, 1098, 1097 — Java RMI Registry + remote objects
+#   4160             — Jini Unicast Discovery (TCP)
+#   4162             — Reggie JRMP object (exploitation port)
+#   8085             — Jini HTTP ClassServer (codebase / path traversal)
+#   8080             — JBoss HTTP invoker (CVE-2015-7501, CVE-2017-7504)
+#   4444             — JBoss JNP (maps to container:1099)
+#
+# Quick start:
+#   docker compose up -d
+#   docker compose logs -f          # watch startup
+#
+# See README.md for full exploitation commands.
+# ============================================================
+
+services:
+
+  # ── Java RMI Registry (pre-JEP290) ────────────────────────────────────────
+  #
+  # Java 8u111 — no deserialization filters.
+  # CommonsCollections 3.1 in classpath.
+  # Exploitable: DGC dirty() on port 1099, Registry bind() on port 1099.
+  # Bound objects: HelloService (:1098), DataService (:1097)
+  #
+  rmi-vuln:
+    build:
+      context: ./rmi-server
+    image: javapwner-lab/rmi-vuln:latest
+    container_name: lab-rmi-vuln
+    ports:
+      - "1099:1099"   # RMI Registry (scan + DGC exploit target)
+      - "1098:1098"   # HelloService remote object
+      - "1097:1097"   # DataService  remote object
+    environment:
+      RMI_HOSTNAME: "127.0.0.1"
+    restart: unless-stopped
+
+  # ── Apache River 2.2.3 Reggie (Jini Lookup Service) ───────────────────────
+  #
+  # Java 8u111 — no deserialization filters.
+  # CommonsCollections 3.1 in classpath.
+  # Port 4160: Unicast Discovery — scan + enumeration target.
+  # Port 4162: Reggie JRMP object — DGC dirty() exploit target.
+  # Port 8085: HTTP ClassServer — codebase + path-traversal target.
+  #
+  jini-reggie:
+    build:
+      context: ./jini-reggie
+    image: javapwner-lab/jini-reggie:latest
+    container_name: lab-jini-reggie
+    ports:
+      - "4160:4160"   # Jini Unicast Discovery
+      - "4162:4162"   # Reggie JRMP remote object (exploit here)
+      - "8085:8085"   # HTTP ClassServer / codebase
+    environment:
+      JINI_HOSTNAME: "127.0.0.1"
+      CODEBASE_URL:  "http://127.0.0.1:8085"
+    restart: unless-stopped
+
+  # ── JBoss AS 4.2.3.GA ─────────────────────────────────────────────────────
+  #
+  # Java 8u111 — no deserialization filters.
+  # CommonsCollections 3.1 added to server/default/lib.
+  # Port 8080: HTTP invoker (JMXInvokerServlet, EJBInvokerServlet).
+  # Port 4444: JBoss JNP (container:1099 → host:4444 — matches javapwner default).
+  #
+  jboss4:
+    build:
+      context: ./jboss4
+    image: javapwner-lab/jboss4:latest
+    container_name: lab-jboss4
+    ports:
+      - "8080:8080"   # JBoss HTTP (HTTP invoker endpoints)
+      - "4444:1099"   # JBoss JNP/JNDI (container 1099 → host 4444)
+    restart: unless-stopped

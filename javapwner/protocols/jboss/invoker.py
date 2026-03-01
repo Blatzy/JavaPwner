@@ -25,7 +25,7 @@ from __future__ import annotations
 import ssl
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 _HTTP_TIMEOUT = 8.0

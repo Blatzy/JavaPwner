@@ -21,7 +21,7 @@ from javapwner.protocols.jini.codebase import CodebaseExplorer
 from javapwner.protocols.jini.enumerator import JiniEnumerator
 from javapwner.protocols.jini.exploiter import JiniExploiter
 from javapwner.protocols.jini.probe import JiniProbe
-from javapwner.protocols.jini.scanner import JiniScanner, MulticastDiscoveryResult
+from javapwner.protocols.jini.scanner import JiniScanner
 
 DEFAULT_PORT = 4160
 

