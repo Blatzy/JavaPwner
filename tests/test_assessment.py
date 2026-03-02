@@ -28,7 +28,7 @@ class TestReworkedSUIDFingerprint:
         )
         assert len(hints) == 1
         assert hints[0]["discriminating"] == "True"
-        assert "JDK ≤ 8" in hints[0]["hint"]
+        assert "JDK 8" in hints[0]["hint"]
 
     def test_marshalled_object_jdk9_is_discriminating(self):
         hints = fingerprint_java_version(

@@ -166,6 +166,9 @@ class TestWrapperInit:
     def test_missing_jar_raises(self, monkeypatch, tmp_path):
         monkeypatch.delenv("YSOSERIAL_PATH", raising=False)
         monkeypatch.chdir(tmp_path)
+        # Patch _find_ysoserial_jar so the project-root lib/ is not found
+        import javapwner.core.payload as _payload_mod
+        monkeypatch.setattr(_payload_mod, "_find_ysoserial_jar", lambda: None)
         with pytest.raises(PayloadError, match="not found"):
             YsoserialWrapper()
 

@@ -24,6 +24,44 @@ from javapwner.protocols.rmi.guesser import RmiMethodGuesser
 
 DEFAULT_PORT = 1099
 
+_JVM_HINT_LABELS: dict[str, str] = {
+    "jdk8u121-8u231":      "JDK 8u121-8u231 (JEP290 property-configurable era)",
+    "jdk8u232+":           "JDK 8u232+ (JEP290 with hardcoded depth>2 check)",
+    "jdk8u232+-or-jdk9+":  "JDK 8u232+ or JDK 9+ (needs SUID to disambiguate)",
+    "jdk8":                "JDK 8 (sub-version unknown)",
+    "jdk9+":               "JDK 9+",
+}
+
+_BYPASS_HINTS: dict[str, str] = {
+    "jdk8u121-8u231":     (
+        "dgcFilter=*;maxdepth=100 property may be sufficient — no code bypass required"
+    ),
+    "jdk8u232+":          (
+        "Requires AllowAll DGC filter via reflection (DGCImpl.dgcFilter = AllowAll)"
+    ),
+    "jdk8u232+-or-jdk9+": (
+        "Requires AllowAll via reflection (Java 8) or Unsafe.putObjectVolatile (Java 9+)"
+    ),
+    "jdk9+":              (
+        "Requires Unsafe.putObjectVolatile bypass + --add-opens"
+    ),
+}
+
+_EXPLOITABILITY_DISPLAY: dict[str, object] = {
+    "critical": lambda fmt: fmt.error(
+        "Exploitability : CRITICAL — DGC unfiltered + compatible gadgets confirmed"
+    ),
+    "high":     lambda fmt: fmt.warning(
+        "Exploitability : HIGH — DGC unfiltered, no gadgets confirmed yet"
+    ),
+    "medium":   lambda fmt: fmt.warning(
+        "Exploitability : MEDIUM — DGC filtered, bypass may be viable"
+    ),
+    "unknown":  lambda fmt: fmt.info(
+        "Exploitability : unknown"
+    ),
+}
+
 
 def _get_fmt(ctx: click.Context) -> OutputFormatter:
     return ctx.obj["formatter"]
@@ -170,6 +208,20 @@ def scan_cmd(
     else:
         fmt.info("DGC JEP 290 : unreachable")
 
+    # JVM version hint
+    if result.jvm_hint != "unknown":
+        conf_str = f"  (confidence: {result.jvm_confidence})"
+        label = _JVM_HINT_LABELS.get(result.jvm_hint, result.jvm_hint)
+        fmt.info(f"  JVM estimate : {label}{conf_str}")
+        bypass = _BYPASS_HINTS.get(result.jvm_hint)
+        if bypass and result.jep290_active is True:
+            fmt.info(f"  Bypass hint  : {bypass}")
+
+    # Exploitability summary
+    exp = result._exploitability()
+    if exp != "unknown":
+        _EXPLOITABILITY_DISPLAY[exp](fmt)
+
     # URLDNS canary
     if result.urldns_sent:
         fmt.section("URLDNS Canary")
@@ -223,6 +275,14 @@ def _display_scan_results(fmt: OutputFormatter, target: str, results: list) -> N
         fmt.info(f"  Registry: {'yes' if r.is_registry else 'no'}")
         jep290_str = d.get("dgc_jep290", "unknown")
         fmt.info(f"  JEP 290 : {jep290_str}")
+
+        if r.jvm_hint != "unknown":
+            label = _JVM_HINT_LABELS.get(r.jvm_hint, r.jvm_hint)
+            fmt.info(f"  JVM est.: {label}  (confidence: {r.jvm_confidence})")
+
+        exp = r._exploitability()
+        if exp != "unknown":
+            _EXPLOITABILITY_DISPLAY[exp](fmt)
 
         if r.bound_names:
             fmt.info(f"  Bound names ({len(r.bound_names)}):")

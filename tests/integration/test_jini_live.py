@@ -42,7 +42,10 @@ class TestLiveScan:
         assert scan_result.is_open, f"Port {_PORT} is not open on {_HOST}"
 
     def test_jrmp_detected(self, scan_result):
-        assert scan_result.is_jrmp, "JRMP was not detected — is this a Reggie?"
+        # Port 4160 is Jini Unicast Discovery, not JRMP. Either JRMP or
+        # unicast_response is sufficient to confirm a Jini/RMI endpoint.
+        assert scan_result.is_jrmp or scan_result.has_unicast_response, \
+            "Neither JRMP nor Unicast Discovery detected — check target"
 
     def test_unicast_response(self, scan_result):
         assert scan_result.has_unicast_response, \
@@ -70,13 +73,21 @@ class TestLiveEnum:
     def test_enum_tier_is_1(self, scan_result):
         enumerator = JiniEnumerator(timeout=10.0)
         result = enumerator.enumerate(_HOST, _PORT, scan_result=scan_result)
-        assert result.tier == 1
+        # Tier ≥ 1 means enumeration succeeded; tier 2 means codebase was also
+        # reachable (e.g. lab HTTP server at 8085), which is a valid outcome.
+        assert result.tier >= 1
 
     def test_enum_extracts_strings(self, scan_result):
         enumerator = JiniEnumerator(timeout=10.0)
         result = enumerator.enumerate(_HOST, _PORT, scan_result=scan_result)
-        # At minimum we expect some strings in a real Reggie response
-        assert len(result.raw_strings) > 0
+        # At tier 2 the enumerator does structured analysis: class_descriptors
+        # and codebase_urls are populated instead of raw_strings.
+        has_info = (
+            len(result.raw_strings) > 0
+            or len(result.codebase_urls) > 0
+            or len(result.class_descriptors) > 0
+        )
+        assert has_info, "No strings, codebase_urls, or class_descriptors extracted"
 
 
 @pytest.mark.live

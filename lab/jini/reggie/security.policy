@@ -1,0 +1,6 @@
+/* Permissive security policy for the lab Reggie instance.
+ * Grants all permissions — NOT for production use.
+ */
+grant {
+    permission java.security.AllPermission;
+};

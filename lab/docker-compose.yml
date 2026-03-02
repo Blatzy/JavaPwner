@@ -4,16 +4,22 @@ version: '3.8'
 #  JavaPwner Vulnerable Lab Environment
 # ============================================================
 #
-# Three realistic Java middleware targets, each running
-# pre-patch versions with known deserialization vulnerabilities.
+# Realistic Java middleware targets across four JDK versions,
+# each running pre-patch versions with known deserialization
+# vulnerabilities (CommonsCollections 3.1 gadget chains).
 #
 # Port layout (host):
-#   1099, 1098, 1097 — Java RMI Registry + remote objects
-#   4160             — Jini Unicast Discovery (TCP)
-#   4162             — Reggie JRMP object (exploitation port)
-#   8085             — Jini HTTP ClassServer (codebase / path traversal)
-#   8080             — JBoss HTTP invoker (CVE-2015-7501, CVE-2017-7504)
-#   4444             — JBoss JNP (maps to container:1099)
+#   1099/1098/1097  — Java 8  RMI Registry + remote objects (JEP290 AllowAll bypass)
+#   1199/1198/1197  — Java 11 RMI Registry + remote objects
+#   1299/1298/1297  — Java 17 RMI Registry + remote objects
+#   1399/1398/1397  — Java 21 RMI Registry + remote objects
+#   1499/1498/1497  — Java 8u111 RMI Registry (pre-JEP290 — no filter at all)
+#   1599/1598/1597  — Java 8u202 RMI Registry (JEP290 property-only bypass)
+#   4160            — Jini Unicast Discovery (TCP)
+#   4162            — Reggie JRMP object (exploitation port)
+#   8085            — Jini HTTP ClassServer (codebase / path traversal)
+#   8080            — JBoss HTTP invoker (CVE-2015-7501, CVE-2017-7504)
+#   4444            — JBoss JNP (maps to container:1099)
 #
 # Quick start:
 #   docker compose up -d
@@ -24,24 +30,134 @@ version: '3.8'
 
 services:
 
-  # ── Java RMI Registry (pre-JEP290) ────────────────────────────────────────
+  # ── Java 8 RMI Registry (Java 8 + JEP290 disabled) ────────────────────────
   #
-  # Java 8u111 — no deserialization filters.
+  # Eclipse Temurin 8 (latest LTS patch).
   # CommonsCollections 3.1 in classpath.
+  # DGC filter disabled via Field.modifiers reflection bypass.
   # Exploitable: DGC dirty() on port 1099, Registry bind() on port 1099.
   # Bound objects: HelloService (:1098), DataService (:1097)
   #
-  rmi-vuln:
+  rmi-java8:
     build:
-      context: ./rmi-server
-    image: javapwner-lab/rmi-vuln:latest
-    container_name: lab-rmi-vuln
+      context: ./rmi/java8
+    image: javapwner-lab/rmi-java8:latest
+    container_name: lab-rmi-java8
     ports:
       - "1099:1099"   # RMI Registry (scan + DGC exploit target)
       - "1098:1098"   # HelloService remote object
       - "1097:1097"   # DataService  remote object
     environment:
       RMI_HOSTNAME: "127.0.0.1"
+    restart: unless-stopped
+
+  # ── Java 11 RMI Registry (Java 11 LTS + JEP290 disabled) ──────────────────
+  #
+  # Eclipse Temurin 11. DGC filter disabled via Unsafe.putObjectVolatile().
+  # CommonsCollections 3.1 in classpath.
+  #
+  rmi-java11:
+    build:
+      context: ./rmi/java11
+    image: javapwner-lab/rmi-java11:latest
+    container_name: lab-rmi-java11
+    ports:
+      - "1199:1199"   # RMI Registry
+      - "1198:1198"   # HelloService remote object
+      - "1197:1197"   # DataService  remote object
+    environment:
+      RMI_HOSTNAME: "127.0.0.1"
+      RMI_REGISTRY_PORT: "1199"
+      RMI_HELLO_PORT: "1198"
+      RMI_DATA_PORT: "1197"
+    restart: unless-stopped
+
+  # ── Java 17 RMI Registry (Java 17 LTS + JEP290 disabled) ──────────────────
+  #
+  # Eclipse Temurin 17. SecurityManager deprecated by default.
+  # DGC filter disabled via Unsafe.putObjectVolatile().
+  # CommonsCollections 3.1 in classpath.
+  #
+  rmi-java17:
+    build:
+      context: ./rmi/java17
+    image: javapwner-lab/rmi-java17:latest
+    container_name: lab-rmi-java17
+    ports:
+      - "1299:1299"   # RMI Registry
+      - "1298:1298"   # HelloService remote object
+      - "1297:1297"   # DataService  remote object
+    environment:
+      RMI_HOSTNAME: "127.0.0.1"
+      RMI_REGISTRY_PORT: "1299"
+      RMI_HELLO_PORT: "1298"
+      RMI_DATA_PORT: "1297"
+    restart: unless-stopped
+
+  # ── Java 21 RMI Registry (Java 21 LTS + JEP290 disabled) ──────────────────
+  #
+  # Eclipse Temurin 21. SecurityManager removed.
+  # DGC filter disabled via Unsafe.putObjectVolatile().
+  # CommonsCollections 3.1 in classpath.
+  #
+  rmi-java21:
+    build:
+      context: ./rmi/java21
+    image: javapwner-lab/rmi-java21:latest
+    container_name: lab-rmi-java21
+    ports:
+      - "1399:1399"   # RMI Registry
+      - "1398:1398"   # HelloService remote object
+      - "1397:1397"   # DataService  remote object
+    environment:
+      RMI_HOSTNAME: "127.0.0.1"
+      RMI_REGISTRY_PORT: "1399"
+      RMI_HELLO_PORT: "1398"
+      RMI_DATA_PORT: "1397"
+    restart: unless-stopped
+
+  # ── Java 8u111 RMI Registry (pre-JEP290 — no filter at all) ──────────────
+  #
+  # Azul Zulu 8u111 — the last Java 8 release before JEP 290 (introduced 8u121).
+  # DGCImpl.dgcFilter field does not exist yet — exploitation is direct, no bypass.
+  # CommonsCollections 3.1 in classpath.
+  # Bound objects: HelloService (:1498), DataService (:1497)
+  #
+  rmi-java8-pre-jep290:
+    build:
+      context: ./rmi/java8-pre-jep290
+    image: javapwner-lab/rmi-java8-pre-jep290:latest
+    container_name: lab-rmi-java8-pre-jep290
+    ports:
+      - "1499:1499"   # RMI Registry
+      - "1498:1498"   # HelloService remote object
+      - "1497:1497"   # DataService  remote object
+    environment:
+      RMI_HOSTNAME: "127.0.0.1"
+    restart: unless-stopped
+
+  # ── Java 8u202 RMI Registry (JEP290 property-only bypass) ─────────────────
+  #
+  # Azul Zulu 8u202 — JEP290 present (8u121+) but hardcoded depth check absent (<8u232).
+  # The system property dgcFilter=*;maxdepth=100 is sufficient to open the filter.
+  # No reflection bypass needed — models a misconfigured production server.
+  # CommonsCollections 3.1 in classpath.
+  # Bound objects: HelloService (:1598), DataService (:1597)
+  #
+  rmi-java8-jep290-configurable:
+    build:
+      context: ./rmi/java8-jep290-configurable
+    image: javapwner-lab/rmi-java8-jep290-configurable:latest
+    container_name: lab-rmi-java8-jep290-configurable
+    ports:
+      - "1599:1599"   # RMI Registry
+      - "1598:1598"   # HelloService remote object
+      - "1597:1597"   # DataService  remote object
+    environment:
+      RMI_HOSTNAME: "127.0.0.1"
+      RMI_REGISTRY_PORT: "1599"
+      RMI_HELLO_PORT: "1598"
+      RMI_DATA_PORT: "1597"
     restart: unless-stopped
 
   # ── Apache River 2.2.3 Reggie (Jini Lookup Service) ───────────────────────
@@ -54,7 +170,7 @@ services:
   #
   jini-reggie:
     build:
-      context: ./jini-reggie
+      context: ./jini/reggie
     image: javapwner-lab/jini-reggie:latest
     container_name: lab-jini-reggie
     ports:
@@ -68,17 +184,25 @@ services:
 
   # ── JBoss AS 4.2.3.GA ─────────────────────────────────────────────────────
   #
-  # Java 8u111 — no deserialization filters.
-  # CommonsCollections 3.1 added to server/default/lib.
+  # Eclipse Temurin 8 (latest LTS). CommonsCollections 3.1 added to
+  # server/default/lib. Lab Java agent installed to bypass DGC filters on
+  # modern JDKs (Java 8u121+) — makes the JNP/JRMP channel exploitable.
   # Port 8080: HTTP invoker (JMXInvokerServlet, EJBInvokerServlet).
-  # Port 4444: JBoss JNP (container:1099 → host:4444 — matches javapwner default).
+  # Port 4444: JBoss JNP (container:1099 → host:4444).
   #
   jboss4:
     build:
-      context: ./jboss4
+      context: ./jboss/as4
     image: javapwner-lab/jboss4:latest
     container_name: lab-jboss4
     ports:
       - "8080:8080"   # JBoss HTTP (HTTP invoker endpoints)
-      - "4444:1099"   # JBoss JNP/JNDI (container 1099 → host 4444)
+      - "4444:1099"   # JBoss JNP/JNDI bootstrap (container 1099 → host 4444)
+      - "4447:4447"   # JBoss JRMP transport for NamingService (jnp-scan / jnp-exploit)
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      start_period: 60s
+      interval: 15s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped

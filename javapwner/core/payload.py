@@ -77,16 +77,18 @@ def _find_ysoserial_jar() -> Path | None:
         if p.is_file():
             return p
 
-    # 2. lib/ysoserial.jar relative to this file's package root
+    # 2. lib/ directory relative to this file's package root (try several names)
     pkg_root = Path(__file__).resolve().parent.parent.parent  # project root
-    candidate = pkg_root / "lib" / "ysoserial.jar"
-    if candidate.is_file():
-        return candidate
+    for name in ("ysoserial.jar", "ysoserial-all.jar"):
+        candidate = pkg_root / "lib" / name
+        if candidate.is_file():
+            return candidate
 
     # 3. CWD
-    cwd_candidate = Path.cwd() / "ysoserial.jar"
-    if cwd_candidate.is_file():
-        return cwd_candidate
+    for name in ("ysoserial.jar", "ysoserial-all.jar"):
+        cwd_candidate = Path.cwd() / name
+        if cwd_candidate.is_file():
+            return cwd_candidate
 
     return None
 

@@ -73,7 +73,7 @@ _SUID_FINGERPRINT_DB: dict[str, dict[int, tuple[str, bool]]] = {
     # ──────────────── DISCRIMINATING entries ────────────────────────────────
     # java.rmi.MarshalledObject — THE key discriminator: SUID changed JDK 9
     "java.rmi.MarshalledObject": {
-        7834398015428807710:  ("JDK ≤ 8 (pre-JEP 290)", True),
+        7834398015428807710:  ("JDK 8 (toutes versions — SUID stable dans tout le JDK 8)", True),
         -4768799335562104920: ("JDK 9+", True),
     },
     # com.sun.jini.reggie.RegistrarProxy — old Sun Jini namespace
@@ -585,6 +585,84 @@ def extract_file_paths(data: bytes) -> list[str]:
         pass
 
     return sorted(paths)
+
+
+def infer_jdk_from_bytes(data: bytes) -> tuple[str, str]:
+    """Infer JDK sub-version from a raw bytes response.
+
+    Inspects class filter error messages and serialised class descriptors to
+    narrow down the JVM version range.  Useful for guiding the pentester on
+    which bypass strategy to use.
+
+    Returns a ``(hint, confidence)`` tuple:
+
+    * **hint** — one of:
+
+      - ``"jdk8u121-8u231"``       — JEP290 present, property-configurable era
+      - ``"jdk8u232+"``            — JEP290 with hardcoded depth>2 check
+      - ``"jdk8u232+-or-jdk9+"``   — java.io.ObjectInputFilter seen, SUID ambiguous
+      - ``"jdk8"``                  — MarshalledObject SUID confirms JDK 8, no filter class
+      - ``"jdk9+"``                 — MarshalledObject SUID confirms JDK 9+
+      - ``"unknown"``               — not enough signal
+
+    * **confidence** — ``"high"`` | ``"medium"`` | ``"none"``
+
+    Detection logic (in priority order):
+
+    1. ``sun/misc/ObjectInputFilter`` or ``sun.misc.ObjectInputFilter`` in data
+       → JDK 8u121–8u231 (high confidence): the filter class used in that era
+       lived in the ``sun.misc`` package.
+
+    2. ``java/io/ObjectInputFilter`` or ``java.io.ObjectInputFilter`` in data
+       → JDK 8u232+ OR JDK 9+ (medium confidence): from 8u232 the class was
+       promoted to ``java.io``; JDK 9 also uses ``java.io``.
+
+    3. ``java.rmi.MarshalledObject`` SUID in serialised class descriptors:
+
+       - SUID ``7834398015428807710`` → JDK 8 (all sub-versions share this SUID)
+       - SUID ``-4768799335562104920`` → JDK 9+
+
+    4. Combination of (2) + JDK-8 SUID → refine to ``"jdk8u232+"`` (high).
+
+    When JEP290 is not active (no filter rejection message), the function can
+    still use SUID-based hints, though these only confirm the major version.
+    """
+    if not data:
+        return ("unknown", "none")
+
+    # Step 1 — sun.misc.ObjectInputFilter: JDK 8u121-8u231
+    if (b"sun/misc/ObjectInputFilter" in data
+            or b"sun.misc.ObjectInputFilter" in data):
+        return ("jdk8u121-8u231", "high")
+
+    # Step 2 — java.io.ObjectInputFilter: JDK 8u232+ or JDK 9+
+    has_java_io_filter = (
+        b"java/io/ObjectInputFilter" in data
+        or b"java.io.ObjectInputFilter" in data
+    )
+
+    # Step 3 — SUID-based inference via class descriptors
+    descriptors = parse_class_descriptors(data)
+    suid_map: dict[str, int] = {
+        d["name"]: d["uid"]
+        for d in descriptors
+        if d["type"] == "class"
+    }
+    marshalled_suid = suid_map.get("java.rmi.MarshalledObject")
+
+    # Step 4 — Combination logic
+    if has_java_io_filter:
+        if marshalled_suid == 7834398015428807710:
+            # java.io + JDK-8 SUID → must be 8u232+
+            return ("jdk8u232+", "high")
+        return ("jdk8u232+-or-jdk9+", "medium")
+
+    if marshalled_suid == 7834398015428807710:
+        return ("jdk8", "high")
+    if marshalled_suid == -4768799335562104920:
+        return ("jdk9+", "high")
+
+    return ("unknown", "none")
 
 
 def extract_system_info(data: bytes) -> dict[str, Any]:

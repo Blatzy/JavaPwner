@@ -1,7 +1,8 @@
-"""Unit tests for JBoss JNP scanner and exploiter (JRMP-based implementation)."""
+"""Unit tests for JBoss JNP scanner and exploiter."""
 
 from __future__ import annotations
 
+import struct
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -11,8 +12,27 @@ from javapwner.protocols.jboss.jnp import (
     JnpExploiter,
     JnpScanResult,
     JnpExploitResult,
+    _extract_jrmp_port,
+    _build_dgc_dirty_call,
 )
 from javapwner.exceptions import ConnectionError as JPConnectionError
+
+
+# ---------------------------------------------------------------------------
+# Minimal JNP bootstrap bytes for testing
+# bootstrap contains: OOS magic + ... + UnicastRef2 block with 127.0.0.1:4447
+# ---------------------------------------------------------------------------
+
+def _make_jnp_bootstrap(host: str = "127.0.0.1", port: int = 4447) -> bytes:
+    """Build minimal JNP bootstrap bytes containing UnicastRef2 with given host:port."""
+    host_bytes = host.encode("utf-8")
+    unicast_block = (
+        b"\x00\x0b" + b"UnicastRef2"           # writeUTF("UnicastRef2")
+        + struct.pack(">H", len(host_bytes)) + host_bytes  # writeUTF(host)
+        + struct.pack(">I", port)               # writeInt(port)
+        + b"\x00" * 20                          # ObjID bytes (not parsed)
+    )
+    return b"\xac\xed\x00\x05" + b"bootstrap_junk" + unicast_block
 
 
 # ---------------------------------------------------------------------------
@@ -289,3 +309,142 @@ class TestJnpExploiter:
 
         assert result.sent is True
         assert result.likely_success is True
+
+
+# ---------------------------------------------------------------------------
+# _extract_jrmp_port helper
+# ---------------------------------------------------------------------------
+
+class TestExtractJrmpPort:
+    def test_extracts_port_from_bootstrap(self):
+        bootstrap = _make_jnp_bootstrap("127.0.0.1", 4447)
+        assert _extract_jrmp_port(bootstrap) == 4447
+
+    def test_returns_none_when_marker_absent(self):
+        assert _extract_jrmp_port(b"\xac\xed\x00\x05no_unicast_here") is None
+
+    def test_returns_none_for_zero_port(self):
+        bootstrap = _make_jnp_bootstrap("127.0.0.1", 0)
+        assert _extract_jrmp_port(bootstrap) is None
+
+    def test_different_host_still_extracts_port(self):
+        bootstrap = _make_jnp_bootstrap("192.168.1.100", 1098)
+        assert _extract_jrmp_port(bootstrap) == 1098
+
+
+# ---------------------------------------------------------------------------
+# _build_dgc_dirty_call helper
+# ---------------------------------------------------------------------------
+
+class TestBuildDgcDirtyCall:
+    def test_starts_with_msg_call(self):
+        from javapwner.protocols.rmi.protocol import MSG_CALL
+        call = _build_dgc_dirty_call(b"\xac\xed\x00\x05payload")
+        assert call[0] == MSG_CALL
+
+    def test_oos_header_present(self):
+        call = _build_dgc_dirty_call(b"\xac\xed\x00\x05payload")
+        assert call[1:5] == b"\xac\xed\x00\x05"
+
+    def test_tc_blockdata_length_34(self):
+        call = _build_dgc_dirty_call(b"\xac\xed\x00\x05payload")
+        # byte[5]=0x77 (TC_BLOCKDATA), byte[6]=34
+        assert call[5] == 0x77
+        assert call[6] == 34
+
+    def test_strips_oos_header_from_payload(self):
+        call = _build_dgc_dirty_call(b"\xac\xed\x00\x05\xca\xfe")
+        assert call.endswith(b"\xca\xfe")
+
+    def test_raw_payload_not_stripped(self):
+        payload = b"\x73\x00\x05raw"
+        call = _build_dgc_dirty_call(payload)
+        assert call.endswith(b"\x73\x00\x05raw")
+
+
+# ---------------------------------------------------------------------------
+# JnpScanner — JNP bootstrap path
+# ---------------------------------------------------------------------------
+
+class TestJnpScannerBootstrap:
+    @patch("javapwner.protocols.jboss.jnp.parse_registry_return")
+    @patch("javapwner.protocols.jboss.jnp.parse_jrmp_ack")
+    @patch("javapwner.protocols.jboss.jnp.TCPSession")
+    def test_bootstrap_detection_sets_is_jnp(self, MockSession, mock_ack, mock_list):
+        """JNP bootstrap (ACED response) on port 4444 → is_jnp=True, is_jrmp=False."""
+        mock_ack.return_value = None
+        mock_list.return_value = {"names": ["java:/DefaultDS"]}
+        bootstrap = _make_jnp_bootstrap("127.0.0.1", 4447)
+        sess = MagicMock()
+        # Phase 1: bootstrap bytes; Phase 2: JRMP ack
+        sess.recv.side_effect = [
+            bootstrap,
+            b"\x4e\x00\x02\x00\x09localhost\x00\x00\x04\x4b",
+        ]
+        sess.recv_all.return_value = b"\x51\x00\x01"
+        _setup_mock_session(MockSession, sess)
+
+        result = JnpScanner(timeout=2.0).scan("127.0.0.1", 4444)
+
+        assert result.is_open is True
+        assert result.is_jnp is True
+        assert result.is_jrmp is False
+
+    @patch("javapwner.protocols.jboss.jnp.TCPSession")
+    def test_bootstrap_no_unicast_ref_yields_error(self, MockSession):
+        """Bootstrap bytes without UnicastRef2 → is_jnp=True but error set."""
+        sess = MagicMock()
+        sess.recv.return_value = b"\xac\xed\x00\x05no_unicast_ref_here"
+        sess.recv_all.return_value = b""
+        _setup_mock_session(MockSession, sess)
+
+        result = JnpScanner(timeout=2.0).scan("127.0.0.1", 4444)
+
+        assert result.is_open is True
+        assert result.is_jnp is True
+        assert result.error is not None
+
+
+# ---------------------------------------------------------------------------
+# JnpExploiter — JNP bootstrap path
+# ---------------------------------------------------------------------------
+
+class TestJnpExploiterBootstrap:
+    @patch("javapwner.protocols.jboss.jnp.detect_exception_in_stream")
+    @patch("javapwner.protocols.jboss.jnp.parse_jrmp_ack")
+    @patch("javapwner.protocols.jboss.jnp.TCPSession")
+    def test_exploit_via_bootstrap_redirects_to_jrmp_port(
+        self, MockSession, mock_ack, mock_detect
+    ):
+        """Bootstrap detection → DGC delivered to embedded JRMP port → sent=True."""
+        mock_ack.return_value = None
+        mock_detect.return_value = False
+        bootstrap = _make_jnp_bootstrap("127.0.0.1", 4447)
+        sess = MagicMock()
+        sess.recv.side_effect = [
+            bootstrap,
+            b"\x4e\x00\x02\x00\x09localhost\x00\x00\x04\x4b",
+        ]
+        sess.recv_all.return_value = b"\x51\x01\x00"
+        _setup_mock_session(MockSession, sess)
+
+        result = JnpExploiter(timeout=2.0).exploit(
+            "127.0.0.1", 4444, b"\xac\xed\x00\x05payload"
+        )
+
+        assert result.sent is True
+
+    @patch("javapwner.protocols.jboss.jnp.TCPSession")
+    def test_exploit_bootstrap_no_unicast_ref_yields_error(self, MockSession):
+        """Bootstrap without UnicastRef2 → sent=False, error set."""
+        sess = MagicMock()
+        sess.recv.return_value = b"\xac\xed\x00\x05no_unicast_ref"
+        sess.recv_all.return_value = b""
+        _setup_mock_session(MockSession, sess)
+
+        result = JnpExploiter(timeout=2.0).exploit(
+            "127.0.0.1", 4444, b"\xac\xed\x00\x05payload"
+        )
+
+        assert result.sent is False
+        assert result.error is not None

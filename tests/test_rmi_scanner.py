@@ -298,7 +298,7 @@ class TestGadgetProbe:
         assert result.gadgets_detection_skipped is False
 
     def test_gadget_probe_exception_response_incompatible(self):
-        """Gadgets that return TC_EXCEPTION are not listed as compatible."""
+        """Gadgets with ClassNotFoundException in response are listed as incompatible."""
         from javapwner.core.payload import YsoserialWrapper
         from unittest.mock import MagicMock
 
@@ -306,8 +306,12 @@ class TestGadgetProbe:
         result = RmiScanResult(host="10.0.0.1", port=1099)
 
         ack = _make_ack()
-        # JRMP RETURN_EXCEPTION response → incompatible (missing class / JEP 290)
-        exception_response = b"\x51\x02\xac\xed\x00\x05\x7b"
+        # JRMP RETURN_EXCEPTION response with ClassNotFoundException
+        # → class not in target classpath → truly incompatible
+        exception_response = (
+            b"\x51\xac\xed\x00\x05\x77\x0f\x02"
+            + b"ClassNotFoundException"
+        )
 
         mock_wrapper = MagicMock(spec=YsoserialWrapper)
         mock_wrapper.list_gadgets.return_value = ["CommonsCollections1"]
