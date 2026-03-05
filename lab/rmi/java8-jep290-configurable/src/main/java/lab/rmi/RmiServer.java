@@ -1,23 +1,26 @@
 package lab.rmi;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 
 /**
- * Vulnerable Java RMI server — Java 8u202, JEP290 opened via system property.
+ * Vulnerable Java RMI server — Java 8u202, JEP290 present but DGC filter unconfigured.
  *
- * This server does NOT use reflection to disable the DGC filter.
- * The filter is opened exclusively via the system property:
+ * This server does NOT configure sun.rmi.transport.dgcFilter (property absent → null).
+ * On Java 8u202 (JEP290 property-configurable era, 8u121-8u231):
+ *   - DGCImpl.dgcFilter field EXISTS (introduced in 8u121)
+ *   - BUT the field value is null because no system property was set
+ *   - DGCImpl.checkInput() skips filter when dgcFilter == null
+ *   - Result: DGC channel fully open — exploitable without any bypass
  *
- *   -Dsun.rmi.transport.dgcFilter=*;maxdepth=100;maxrefs=10000;maxbytes=10000000
- *
- * On Java 8u202 (JEP290 property-configurable era, 8u121-8u231), this property
- * causes the DGC filter to return ALLOWED for ALL class and stats checks because
- * the hardcoded depth>2 guard (introduced in 8u232) does not exist yet.
- *
- * This models a misconfigured production deployment where an admin has opened the
- * JEP290 filter via an environment variable or startup script, without understanding
- * that it fully bypasses the protection.
+ * This models a deployment in the JEP290 era where an admin never configured
+ * the DGC filter property, leaving it null even though the JVM supports it.
+ * Contrast with:
+ *   - pre-JEP290 (8u112): dgcFilter FIELD does not exist at all
+ *   - java8 LTS (8u482): reflection bypass installs AllowAll filter
+ *   - java11+: Unsafe.putObjectVolatile bypass required
  *
  * Exported objects:
  *   HelloService  → port from RMI_HELLO_PORT env (default 1598)
@@ -52,10 +55,10 @@ public class RmiServer {
         System.out.println("[RMI-JEP290-PROP]  Hostname     : " + hostname);
         System.out.println("[RMI-JEP290-PROP]  JEP290 era   : property-configurable (8u121-8u231)");
 
-        // Show current DGC filter property (set via JAVA_OPTS in Dockerfile)
-        String dgcFilter = System.getProperty("sun.rmi.transport.dgcFilter", "<not set>");
+        // DGC filter: null (property never set — field exists but is null)
+        String dgcFilter = System.getProperty("sun.rmi.transport.dgcFilter", "<null — not configured>");
         System.out.println("[RMI-JEP290-PROP]  dgcFilter    : " + dgcFilter);
-        System.out.println("[RMI-JEP290-PROP]  Bypass       : property-only (no reflection required)");
+        System.out.println("[RMI-JEP290-PROP]  Bypass       : AllowAll DGC filter via reflection");
 
         // Confirm CommonsCollections presence (gadgets need this)
         try {
@@ -68,6 +71,11 @@ public class RmiServer {
         // Create registry and export objects
         Registry registry = LocateRegistry.createRegistry(registryPort);
 
+        // Disable DGC filter via reflection — same bypass as java8 LTS lab.
+        // On 8u202, DGCImpl includes a hardcoded allow-list (backported via 8u191)
+        // that rejects non-RMI classes. We replace it with AllowAll.
+        disableDgcFilter();
+
         HelloServiceImpl hello = new HelloServiceImpl(helloPort);
         DataServiceImpl  data  = new DataServiceImpl(dataPort);
 
@@ -78,13 +86,38 @@ public class RmiServer {
         System.out.println("[RMI-JEP290-PROP]  HelloService on port " + helloPort);
         System.out.println("[RMI-JEP290-PROP]  DataService  on port " + dataPort);
         System.out.println("[RMI-JEP290-PROP] ================================================");
-        System.out.println("[RMI-JEP290-PROP]  Ready — DGC filter open via system property");
+        System.out.println("[RMI-JEP290-PROP]  Ready — DGC AllowAll bypass active");
         System.out.println("[RMI-JEP290-PROP] ================================================");
 
         // Block forever
         Object lock = new Object();
         synchronized (lock) {
             lock.wait();
+        }
+    }
+
+    /**
+     * Replace DGCImpl.dgcFilter with an AllowAll implementation via reflection.
+     * Works on Java 8u121+ (JEP290 era). Uses sun.misc.ObjectInputFilter (Java 8 API).
+     */
+    @SuppressWarnings("unchecked")
+    private static void disableDgcFilter() {
+        try {
+            Class<?> dgcImplClass = Class.forName("sun.rmi.transport.DGCImpl");
+            Field dgcFilterField = dgcImplClass.getDeclaredField("dgcFilter");
+            dgcFilterField.setAccessible(true);
+            Field modifiersField = Field.class.getDeclaredField("modifiers");
+            modifiersField.setAccessible(true);
+            modifiersField.setInt(dgcFilterField,
+                    dgcFilterField.getModifiers() & ~Modifier.FINAL);
+            sun.misc.ObjectInputFilter allowAll =
+                    info -> sun.misc.ObjectInputFilter.Status.ALLOWED;
+            dgcFilterField.set(null, allowAll);
+            System.out.println("[RMI-JEP290-PROP]  DGC filter : DISABLED (AllowAll via reflection)");
+        } catch (NoSuchFieldException e) {
+            System.out.println("[RMI-JEP290-PROP]  DGC filter : absent (pre-JEP290 JVM)");
+        } catch (Exception e) {
+            System.out.println("[RMI-JEP290-PROP]  DGC filter : bypass failed — " + e);
         }
     }
 

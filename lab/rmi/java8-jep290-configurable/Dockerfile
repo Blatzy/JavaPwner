@@ -23,12 +23,12 @@ RUN mvn -q package -DskipTests
 #
 # CommonsCollections 3.1 in classpath → exploitable via DGC dirty().
 #
-FROM azul/zulu-openjdk:8u202-jdk
+FROM azul/zulu-openjdk:8u202
 
-LABEL description="Vulnerable Java RMI Registry — Java 8u202 JEP290 property-only bypass" \
-      attack-surface="RMI DGC dirty() — JEP290 present but opened via system property" \
-      jep290-era="JEP290 property-configurable (8u121-8u231) — no hardcoded depth check" \
-      cve="misconfigured JEP290 (dgcFilter=* via system property)"
+LABEL description="Vulnerable Java RMI Registry — Java 8u202 JEP290 present but DGC unconfigured" \
+      attack-surface="RMI DGC dirty() — JEP290 present but dgcFilter=null (property never set)" \
+      jep290-era="JEP290 property-configurable (8u121-8u231) — filter field exists but null" \
+      cve="unconfigured JEP290 dgcFilter — DGC fully open"
 
 WORKDIR /app
 COPY --from=builder /build/target/rmi-server-fat.jar .
@@ -43,7 +43,5 @@ CMD ["sh", "-c", \
      "exec java \
       -Djava.rmi.server.hostname=${RMI_HOSTNAME:-127.0.0.1} \
       -Djava.rmi.server.logCalls=false \
-      -Dsun.rmi.transport.dgcFilter='*;maxdepth=100;maxrefs=10000;maxbytes=10000000' \
-      -Dsun.rmi.registry.registryFilter='*;maxdepth=100;maxrefs=10000;maxbytes=10000000' \
       -jar /app/rmi-server-fat.jar \
       ${RMI_REGISTRY_PORT:-1599} ${RMI_HELLO_PORT:-1598} ${RMI_DATA_PORT:-1597}"]

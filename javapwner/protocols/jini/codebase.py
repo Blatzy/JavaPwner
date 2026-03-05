@@ -23,14 +23,18 @@ for filesystem enumeration and arbitrary file reading.
 from __future__ import annotations
 
 import re
+import socket
 import struct
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 _DEFAULT_TIMEOUT = 5.0
+
+# Apache River's ClassServer can take up to ~10s before sending its response
+# (class loading, security checks, etc.).  This minimum is enforced in _fetch
+# to avoid spurious "UNREACHABLE" results on slow but reachable ClassServers.
+_CLASSSERVER_MIN_RECV_TIMEOUT = 12.0
 
 # Traversal probes can use a shorter timeout: if the server is reachable,
 # 404 / 403 responses come back immediately.  Long waits mean the path is
@@ -537,25 +541,18 @@ class CodebaseExplorer:
         return url
 
     def _fingerprint(self, base_url: str) -> dict[str, Any]:
-        try:
-            req = urllib.request.Request(base_url, method="GET")
-            req.add_header("User-Agent", "Java/1.8.0_191")
-            resp = urllib.request.urlopen(req, timeout=self.timeout)
-            server = resp.headers.get("Server", "")
-            return {"reachable": True, "server": server, "status": resp.status}
-        except urllib.error.HTTPError as exc:
-            server = exc.headers.get("Server", "") if exc.headers else ""
-            return {"reachable": True, "server": server, "status": exc.code}
-        except Exception:
-            return {"reachable": False, "server": "", "status": 0}
+        res = self._fetch(base_url)
+        if res["success"] or res["status"] > 0:
+            return {"reachable": True, "server": res.get("server", ""), "status": res["status"]}
+        return {"reachable": False, "server": "", "status": 0}
 
     def _try_directory_listing(self, url: str) -> list[str]:
         entries: list[str] = []
         try:
-            req = urllib.request.Request(url, method="GET")
-            req.add_header("User-Agent", "Java/1.8.0_191")
-            resp = urllib.request.urlopen(req, timeout=self.timeout)
-            body = resp.read(65536).decode("utf-8", errors="replace")
+            res = self._fetch(url)
+            if not res["success"] and not res["body"]:
+                return entries
+            body = res["body"].decode("utf-8", errors="replace")
 
             # HTML directory index
             links = re.findall(r'href=["\']([^"\']+)["\']', body, re.IGNORECASE)
@@ -636,21 +633,79 @@ class CodebaseExplorer:
         return FileReadResult(path=file_path)
 
     def _fetch(self, url: str, *, timeout: float | None = None) -> dict[str, Any]:
+        """Fetch *url* using a raw TCP socket with half-close (SHUT_WR).
+
+        Apache River's ClassServer reads the HTTP request line-by-line using
+        DataInputStream and only responds after the client signals EOF on the
+        write side (SHUT_WR).  Standard HTTP libraries (urllib, requests) keep
+        the socket open for persistent connections and therefore never trigger
+        the response.  This raw implementation explicitly calls shutdown(SHUT_WR)
+        after sending the full request, matching the behaviour of ``nc`` or
+        ``printf ... | nc``.
+        """
         t = timeout if timeout is not None else self.timeout
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.hostname or ""
+        port = parsed.port or 80
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+
         try:
-            req = urllib.request.Request(url, method="GET")
-            req.add_header("User-Agent", "Java/1.8.0_191")
-            resp = urllib.request.urlopen(req, timeout=t)
-            body = resp.read(1_048_576)
-            return {"success": True, "status": resp.status, "body": body}
-        except urllib.error.HTTPError as exc:
-            try:
-                body = exc.read(1_048_576)
-            except Exception:
-                body = b""
-            return {"success": False, "status": exc.code, "body": body}
-        except Exception:
-            return {"success": False, "status": 0, "body": b""}
+            sock = socket.create_connection((host, port), timeout=t)
+            # Host header must NOT include the port — Apache River ClassServer
+            # does not parse RFC 2732 host:port format and hangs if it's present.
+            request = (
+                f"GET {path} HTTP/1.0\r\n"
+                f"Host: {host}\r\n"
+                f"User-Agent: Java/1.8.0_191\r\n"
+                f"\r\n"
+            ).encode()
+            sock.sendall(request)
+            sock.shutdown(socket.SHUT_WR)  # signal end-of-request to ClassServer
+
+            # Apache River ClassServer may take longer than the connection timeout
+            # to send its response (class loading, security checks).  Use at least
+            # _CLASSSERVER_MIN_RECV_TIMEOUT for the read phase.
+            recv_timeout = max(t, _CLASSSERVER_MIN_RECV_TIMEOUT)
+            sock.settimeout(recv_timeout)
+            chunks: list[bytes] = []
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            sock.close()
+
+            raw = b"".join(chunks)
+            # Parse minimal HTTP response
+            if not raw:
+                return {"success": False, "status": 0, "body": b"", "server": ""}
+            header_end = raw.find(b"\r\n\r\n")
+            if header_end == -1:
+                header_end = raw.find(b"\n\n")
+                split = 2
+            else:
+                split = 4
+            header_bytes = raw[:header_end] if header_end != -1 else raw
+            body = raw[header_end + split:] if header_end != -1 else b""
+            header_text = header_bytes.decode("latin-1", errors="replace")
+            status = 0
+            server = ""
+            for i, line in enumerate(header_text.splitlines()):
+                if i == 0 and line.startswith("HTTP"):
+                    parts = line.split(" ", 2)
+                    if len(parts) >= 2:
+                        try:
+                            status = int(parts[1])
+                        except ValueError:
+                            pass
+                elif line.lower().startswith("server:"):
+                    server = line.split(":", 1)[1].strip()
+            success = 200 <= status < 300
+            return {"success": success, "status": status, "body": body, "server": server}
+        except OSError:
+            return {"success": False, "status": 0, "body": b"", "server": ""}
 
     @staticmethod
     def _looks_like_content(body: bytes, path: str) -> bool:

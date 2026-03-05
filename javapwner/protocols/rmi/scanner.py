@@ -106,6 +106,7 @@ class RmiScanResult:
             "is_registry": self.is_registry,
             "bound_names": self.bound_names,
             "dgc_jep290": jep290_str,
+            "jep290_active": self.jep290_active,
             "jvm_hint": self.jvm_hint,
             "jvm_confidence": self.jvm_confidence,
             "exploitability": self._exploitability(),

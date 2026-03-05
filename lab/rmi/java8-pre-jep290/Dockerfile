@@ -10,7 +10,7 @@ RUN mvn -q package -DskipTests
 
 # ── Stage 2: Runtime ─────────────────────────────────────────────────────────
 #
-# Azul Zulu 8u111 — the last Java 8 release BEFORE JEP 290 (introduced 8u121).
+# Azul Zulu 8u112 — Java 8 release BEFORE JEP 290 (introduced 8u121).
 # This JVM has NO deserialization filter on the DGC channel whatsoever:
 #   - DGCImpl.dgcFilter field does not exist yet
 #   - No property-based filter support
@@ -19,9 +19,9 @@ RUN mvn -q package -DskipTests
 # CommonsCollections 3.1 in classpath → directly exploitable, no bypass needed.
 # Represents the most common legacy scenario in pre-2017 Java deployments.
 #
-FROM azul/zulu-openjdk:8u111-jdk
+FROM azul/zulu-openjdk:8u112
 
-LABEL description="Vulnerable Java RMI Registry — Java 8u111 pre-JEP290 (no filter at all)" \
+LABEL description="Vulnerable Java RMI Registry — Java 8u112 pre-JEP290 (no filter at all)" \
       attack-surface="RMI DGC dirty() — no filter, direct RCE" \
       jep290-era="pre-JEP290 (< 8u121) — DGCImpl.dgcFilter field absent" \
       cve="no filter — CVE-2011-3521 era exploitation model"

@@ -20,11 +20,16 @@ echo "  HTTP codebase : 8085"
 echo "============================================================"
 
 # ── 1. Start HTTP ClassServer (serves reggie-dl JAR to clients) ──────────────
-echo "[CLASSSERVER] Starting on port 8085 serving $JINI_LIB ..."
+# The ClassServer is deliberately started from the filesystem root (-dir /)
+# so that its path-traversal check (canonical path must start with dir) allows
+# access to any file on the container.  This makes the HTTP codebase server a
+# path-traversal attack vector — the intended lab vulnerability.
+# Reggie class files are still reachable under /jini/lib/.
+echo "[CLASSSERVER] Starting on port 8085 serving / (traversal-vulnerable) ..."
 java -cp "$JINI_LIB/tools-2.2.3.jar:$JINI_LIB/jsk-lib-2.2.3.jar:$JINI_LIB/jsk-platform-2.2.3.jar" \
      com.sun.jini.tool.ClassServer \
      -port 8085 \
-     -dir "$JINI_LIB" \
+     -dir / \
      -verbose &
 CLASSSERVER_PID=$!
 
@@ -45,7 +50,7 @@ echo "[REGGIE] Starting TransientRegistrarImpl ..."
 exec java \
     -Djava.security.policy="$POLICY" \
     -Djava.rmi.server.hostname="$HOSTNAME" \
-    -Djava.rmi.server.codebase="${CODEBASE_URL}/reggie-dl-2.2.3.jar" \
+    -Djava.rmi.server.codebase="${CODEBASE_URL}/jini/lib/reggie-dl-2.2.3.jar" \
     -Djava.rmi.server.useCodebaseOnly=false \
     -Dnet.jini.discovery.interface=0.0.0.0 \
     -Dsun.rmi.transport.dgcFilter='*;maxdepth=100;maxrefs=10000;maxbytes=10000000' \

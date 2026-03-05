@@ -374,16 +374,34 @@ def extract_raw_urls(data: bytes) -> list[str]:
 def extract_endpoint_hints(data: bytes) -> list[dict]:
     """Extract ``(host, port)`` hints from a Java serialization stream.
 
-    Looks for TC_STRING values that match a valid hostname / IPv4 pattern,
-    followed immediately by a big-endian ``uint32`` port in ``[1, 65535]``.
-    Also scans all nested streams found within *data*.
+    Two strategies are applied:
+
+    1. **TC_STRING scan** — looks for TC_STRING tokens (0x74) containing a
+       valid hostname / IPv4 string, followed by a big-endian ``uint32`` port.
+       This catches endpoints serialised via ``ObjectOutputStream.writeObject``.
+
+    2. **writeUTF scan** — Java's ``DataOutput.writeUTF()`` encodes strings as
+       a 2-byte big-endian length followed by UTF bytes, with NO TC_STRING
+       marker.  ``TCPEndpoint.write()`` uses this format: it emits one format
+       byte (0x00), then ``writeUTF(host)``, then ``writeInt(port)``.  This
+       covers Jini / Apache River Reggie proxies whose embedded JRMP endpoint
+       is encoded via ``writeUTF`` rather than ``TC_STRING``.
+
+    Both strategies scan all nested streams found within *data*.
 
     Returns a deduplicated list of ``{"host": str, "port": int}`` dicts.
     """
     seen: set[tuple[str, int]] = set()
     results: list[dict] = []
 
-    def _scan(buf: bytes) -> None:
+    def _add(s: str, port: int) -> None:
+        key = (s, port)
+        if key not in seen:
+            seen.add(key)
+            results.append({"host": s, "port": port})
+
+    def _scan_tc_string(buf: bytes) -> None:
+        """Scan TC_STRING-encoded hostname followed by writeInt port."""
         for s, end_off in extract_strings_with_offsets(buf):
             if len(s) > _MAX_HOST_LEN:
                 continue
@@ -396,14 +414,51 @@ def extract_endpoint_hints(data: bytes) -> list[dict]:
             except struct.error:
                 continue
             if 1 <= port <= 65535:
-                key = (s, port)
-                if key not in seen:
-                    seen.add(key)
-                    results.append({"host": s, "port": port})
+                _add(s, port)
 
-    _scan(data)
-    for _, sub in find_nested_streams(data):
-        _scan(sub)
+    # Matches only dotted hostnames (FQDNs, IPv4) — not bare labels.
+    # Bare labels (e.g. Java class names like "UnicastRef2") are excluded to
+    # reduce false positives from writeUTF string data in the stream.
+    _dotted_host_re = re.compile(
+        r"^(?:(?:\d{1,3}\.){3}\d{1,3}"          # IPv4
+        r"|(?:[a-zA-Z0-9\-]+\.)+[a-zA-Z0-9\-]+)$"  # FQDN (at least one dot)
+    )
+
+    def _scan_writeutf(buf: bytes) -> None:
+        """Scan writeUTF-encoded hostname followed by writeInt port.
+
+        Searches every byte offset for a 2-byte big-endian length prefix that
+        could introduce a valid hostname.  This catches ``TCPEndpoint.write()``
+        output where the format is: [1-byte flag] [2-byte len] [host bytes]
+        [4-byte port].
+
+        Only dotted hostnames (IPv4 or FQDN) are accepted to suppress false
+        positives from Java class names and other non-hostname strings.
+        """
+        n = len(buf)
+        for i in range(n - 6):  # need at least 2 (len) + 1 (host) + 4 (port)
+            str_len = struct.unpack_from(">H", buf, i)[0]
+            if str_len < 3 or str_len > _MAX_HOST_LEN:
+                continue
+            end = i + 2 + str_len
+            if end + 4 > n:
+                continue
+            try:
+                s = buf[i + 2: end].decode("ascii")
+            except Exception:
+                continue
+            if not _dotted_host_re.match(s):
+                continue
+            try:
+                port = struct.unpack_from(">I", buf, end)[0]
+            except struct.error:
+                continue
+            if 1 <= port <= 65535:
+                _add(s, port)
+
+    for buf in [data] + [sub for _, sub in find_nested_streams(data)]:
+        _scan_tc_string(buf)
+        _scan_writeutf(buf)
 
     return results
 

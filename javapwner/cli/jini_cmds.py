@@ -77,7 +77,12 @@ def _scan_cmd_json(
     dgc_result = None
     try:
         probe = JiniProbe(timeout=timeout)
-        dgc_result = probe.probe_dgc(target, port)
+        dgc_port = port
+        if ep_result and ep_result.confirmed:
+            dgc_port = ep_result.confirmed["port"]
+        elif enum_result and enum_result.embedded_endpoints:
+            dgc_port = enum_result.embedded_endpoints[0]["port"]
+        dgc_result = probe.probe_dgc(target, dgc_port)
     except JavaPwnerError:
         pass
 
@@ -292,11 +297,18 @@ def scan_cmd(ctx: click.Context, target: str, port: int, no_codebase: bool,
         fmt.info("No additional JRMP endpoints discovered.")
 
     # DGC fingerprint (harmless HashMap — no ysoserial needed)
+    # Use the confirmed JRMP endpoint port when available; Jini discovery ports
+    # (e.g. 4160) are not JRMP endpoints themselves.
     dgc_result = None
+    dgc_port = port
+    if ep_result and ep_result.confirmed:
+        dgc_port = ep_result.confirmed["port"]
+    elif enum_result and enum_result.embedded_endpoints:
+        dgc_port = enum_result.embedded_endpoints[0]["port"]
     try:
         probe = JiniProbe(timeout=timeout)
         with fmt.status("Probing DGC deserialization filters (JEP 290)…"):
-            dgc_result = probe.probe_dgc(target, port)
+            dgc_result = probe.probe_dgc(target, dgc_port)
         d = dgc_result.to_dict()
         status_str = d.get("status", "unknown")
         if dgc_result.jep290_active is False:
